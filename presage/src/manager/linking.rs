@@ -60,11 +60,34 @@ impl<S: Store> Manager<S, Linking> {
     /// }
     /// ```
     pub async fn link_secondary_device(
-        mut store: S,
+        store: S,
         signal_servers: SignalServers,
         device_name: String,
         provisioning_link_channel: oneshot::Sender<Url>,
     ) -> Result<Manager<S, Registered>, Error<S::Error>> {
+        Self::link_secondary_device_with_history(
+            store,
+            signal_servers,
+            device_name,
+            provisioning_link_channel,
+        )
+        .await
+        .map(|(manager, _)| manager)
+    }
+
+    /// Like [`Manager::link_secondary_device`], but also returns the one-time key for the
+    /// message history transfer ("link and sync"), if the primary device chose to send one.
+    ///
+    /// The primary device only offers the transfer when the provisioning URL advertises it,
+    /// by appending `&capabilities=backup5` to the URL before showing it as a QR code. The
+    /// key decrypts the archive that the primary device then uploads; see
+    /// `GET /v1/devices/transfer_archive`.
+    pub async fn link_secondary_device_with_history(
+        mut store: S,
+        signal_servers: SignalServers,
+        device_name: String,
+        provisioning_link_channel: oneshot::Sender<Url>,
+    ) -> Result<(Manager<S, Registered>, Option<[u8; 32]>), Error<S::Error>> {
         // clear the database: the moment we start the process, old API credentials are invalidated
         // and you won't be able to use this client anyways
         store.clear_registration().await?;
@@ -126,7 +149,7 @@ impl<S: Store> Manager<S, Linking> {
                 pni_public_key,
                 profile_key,
                 account_entropy_pool,
-                ephemeral_backup_key: _,
+                ephemeral_backup_key,
             }) => {
                 let registration_data = RegistrationData {
                     signal_servers,
@@ -177,7 +200,7 @@ impl<S: Store> Manager<S, Linking> {
                     state: Registered::with_data(registration_data),
                 };
 
-                Ok(manager)
+                Ok((manager, ephemeral_backup_key))
             }
             Err(e) => {
                 store.clear_registration().await?;

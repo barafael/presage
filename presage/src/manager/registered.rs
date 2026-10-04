@@ -1667,6 +1667,32 @@ impl<S: Store> Manager<S, Registered> {
             .into()),
         }
     }
+    /// As a linked device, removes this device from the account, e.g. before linking again
+    /// after a failed setup, so the phone's list of linked devices doesn't fill up with dead
+    /// entries. The server allows a linked device to remove itself (`DELETE /v1/devices/{id}`).
+    pub async fn unlink_self(&self) -> Result<(), Error<S::Error>> {
+        // The server refuses to remove the primary device.
+        let device_id = self.device_id();
+        let response = self
+            .identified_push_service()
+            .request(
+                reqwest::Method::DELETE,
+                Endpoint::service(format!("/v1/devices/{}", u8::from(device_id))),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await
+            .map_err(ServiceError::from)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ServiceError::UnhandledResponseCode {
+                status: response.status(),
+                body: response.text().await.unwrap_or_default(),
+            }
+            .into())
+        }
+    }
 }
 
 /// Outcome of waiting for the message history archive; see [`Manager::transfer_archive`].

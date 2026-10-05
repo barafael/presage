@@ -337,6 +337,30 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
+    /// What it takes to read and write the storage service directly: the authenticated push
+    /// service and the storage key. `None` as for [`Self::storage_service`]. For clients that
+    /// must edit records without decoding them (to keep fields they don't know).
+    pub async fn storage_access(
+        &self,
+    ) -> Result<
+        Option<(
+            libsignal_service::push_service::PushService,
+            libsignal_service::master_key::StorageServiceKey,
+        )>,
+        Error<S::Error>,
+    > {
+        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
+        let Some(pool) = self.account_entropy_pool().await? else {
+            return Ok(None);
+        };
+        let master_key =
+            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
+        Ok(Some((
+            self.identified_push_service(),
+            StorageServiceKey::from_master_key(&master_key),
+        )))
+    }
+
     /// The storage service, where the primary device keeps the account's settings and those
     /// of each contact and group (pinned, muted, archived, blocked, …). `None` while this
     /// device doesn't have the account entropy pool, which the primary device sends with keys.

@@ -337,6 +337,25 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
+    /// The storage service, where the primary device keeps the account's settings and those
+    /// of each contact and group (pinned, muted, archived, blocked, …). `None` while this
+    /// device doesn't have the account entropy pool, which the primary device sends with keys.
+    pub async fn storage_service(
+        &self,
+    ) -> Result<Option<libsignal_service::StorageService>, Error<S::Error>> {
+        let Some(pool) = self.account_entropy_pool().await? else {
+            return Ok(None);
+        };
+        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
+        // The SVR key is the account's master key.
+        let master_key =
+            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
+        let key = StorageServiceKey::from_master_key(&master_key);
+        let service =
+            libsignal_service::StorageService::new(self.identified_push_service(), key).await?;
+        Ok(Some(service))
+    }
+
     async fn account_entropy_pool(&self) -> Result<Option<AccountEntropyPool>, Error<S::Error>> {
         let from_store = self.store().fetch_account_entropy_pool().await?;
 

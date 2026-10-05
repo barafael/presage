@@ -1216,6 +1216,302 @@ impl<S: Store> Manager<S, Registered> {
         Ok(upload.await)
     }
 
+    /// Creates a group with us as its administrator and `members` in it, and tells them.
+    /// Members whose profile key we don't have are invited (pending) instead. Returns the new
+    /// group's master key, and the time of the message telling the members (stored too).
+    pub async fn create_group(
+        &mut self,
+        title: &str,
+        members: &[Aci],
+    ) -> Result<([u8; 32], u64), Error<S::Error>> {
+        use libsignal_service::groups_v2::{
+            AccessControl, AccessRequired, GroupMemberCandidate, GroupOperations,
+        };
+        use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+
+        let master_key: [u8; 32] = rand::random();
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(master_key),
+        ));
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let server_public_params = groups_manager.server_public_params().clone();
+        let own = self.state.data.service_ids.aci();
+        let own_credential = self
+            .profile_key_credential(own, self.state.data.profile_key(), &server_public_params)
+            .await?;
+        let mut candidates = Vec::new();
+        for member in members.iter().filter(|m| **m != own) {
+            let credential = match self.store.profile_key(&(*member).into()).await? {
+                Some(key) => self
+                    .profile_key_credential(*member, key, &server_public_params)
+                    .await
+                    .inspect_err(|error| warn!(%error, "no profile key credential; inviting"))
+                    .ok(),
+                None => None,
+            };
+            candidates.push(GroupMemberCandidate {
+                service_id: (*member).into(),
+                credential,
+            });
+        }
+        // As Signal's apps make new groups: members may change its details and add others,
+        // joining by link is off.
+        let access = AccessControl {
+            attributes: AccessRequired::Member,
+            members: AccessRequired::Member,
+            add_from_invite_link: AccessRequired::Unsatisfiable,
+            member_label: AccessRequired::Member,
+        };
+        let group = operations
+            .encrypt_group_with_credentials(
+                title,
+                None,
+                None,
+                Some(&access),
+                &own_credential,
+                &candidates,
+                &server_public_params,
+                String::new(),
+                &mut rng(),
+            )
+            .map_err(|e| Error::ServiceError(e.into()))?;
+        groups_manager
+            .create_group(&mut rng(), &master_key, group)
+            .await?;
+        upsert_group(&self.store, &mut groups_manager, &master_key, &0).await?;
+        // A message in the group lets the members' apps know it.
+        let message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let recipients: Vec<Aci> = members.iter().copied().filter(|m| *m != own).collect();
+        let timestamp = Self::now();
+        self.send_to_members(&master_key, &recipients, message, timestamp)
+            .await?;
+        Ok((master_key, timestamp))
+    }
+
+    /// Changes a group, and tells its members (and anyone removed) with the change as the
+    /// server signed it. Returns the time of that message (stored too).
+    pub async fn change_group(
+        &mut self,
+        master_key: &[u8; 32],
+        change: GroupEdit,
+    ) -> Result<u64, Error<S::Error>> {
+        use libsignal_service::groups_v2::{GroupOperations, Role};
+        use libsignal_service::proto::group_change::Actions;
+        use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let Some(group) = upsert_group(&self.store, &mut groups_manager, master_key, &0).await?
+        else {
+            return Err(Error::UnknownGroup);
+        };
+        let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(*master_key),
+        ));
+        let decoding =
+            |e| Error::ServiceError(libsignal_service::push_service::ServiceError::from(e));
+        let own = self.state.data.service_ids.aci();
+        let mut actions = Actions {
+            version: group.revision + 1,
+            ..Default::default()
+        };
+        // Who hears of it: the members before the change and those added.
+        let mut told: Vec<Aci> = group.members.iter().map(|m| m.aci).collect();
+        let leaving = matches!(change, GroupEdit::Leave);
+        match change {
+            GroupEdit::Title(title) => {
+                actions.modify_title =
+                    Some(operations.build_modify_title_action(&title, &mut rng()));
+            }
+            GroupEdit::Description(description) => {
+                actions.modify_description =
+                    Some(operations.build_modify_description_action(&description, &mut rng()));
+            }
+            GroupEdit::Timer(seconds) => {
+                actions.modify_disappearing_message_timer = Some(
+                    operations.build_modify_disappearing_messages_timer_action(seconds, &mut rng()),
+                );
+            }
+            GroupEdit::AddMembers(members) => {
+                let server_public_params = groups_manager.server_public_params().clone();
+                for member in members {
+                    let key = self.store.profile_key(&member.into()).await?;
+                    let credential = match key {
+                        Some(key) => self
+                            .profile_key_credential(member, key, &server_public_params)
+                            .await
+                            .ok(),
+                        None => None,
+                    };
+                    match credential {
+                        Some(credential) => actions.add_members.push(
+                            operations.build_add_member_action_with_credential(
+                                &credential,
+                                Role::Default,
+                                &server_public_params,
+                            ),
+                        ),
+                        // Invited: they join once their app sees it.
+                        None => actions.add_members_pending_profile_key.push(
+                            operations
+                                .build_add_pending_member_action(member.into(), own, Role::Default)
+                                .map_err(decoding)?,
+                        ),
+                    }
+                    told.push(member);
+                }
+            }
+            GroupEdit::RemoveMember(member) => {
+                actions.delete_members.push(
+                    operations
+                        .build_remove_member_action(member)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::SetAdmin(member, admin) => {
+                let role = if admin {
+                    Role::Administrator
+                } else {
+                    Role::Default
+                };
+                actions.modify_member_roles.push(
+                    operations
+                        .build_modify_member_role_action(member, role)
+                        .map_err(decoding)?,
+                );
+            }
+            GroupEdit::Leave => {
+                actions.delete_members.push(
+                    operations
+                        .build_remove_member_action(own)
+                        .map_err(decoding)?,
+                );
+            }
+        }
+        let revision = actions.version;
+        let signed = groups_manager
+            .modify_group(&mut rng(), master_key, actions)
+            .await?;
+        // Our copy follows; once we left, the server no longer shows it to us, so it is
+        // changed here.
+        if leaving {
+            let mut left = group;
+            left.members.retain(|m| m.aci != own);
+            left.revision = revision;
+            self.store.save_group(*master_key, left).await?;
+        } else {
+            upsert_group(&self.store, &mut groups_manager, master_key, &revision).await?;
+        }
+        let message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(revision),
+                group_change: Some(libsignal_service::prelude::ProtobufMessage::encode_to_vec(
+                    &signed,
+                )),
+            }),
+            ..Default::default()
+        };
+        told.retain(|member| *member != own);
+        told.dedup();
+        let timestamp = Self::now();
+        self.send_to_members(master_key, &told, message, timestamp)
+            .await?;
+        Ok(timestamp)
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after 1970")
+            .as_millis() as u64
+    }
+
+    /// Someone's expiring profile key credential, which adding them to a group requires.
+    async fn profile_key_credential(
+        &self,
+        aci: Aci,
+        profile_key: ProfileKey,
+        server_public_params: &libsignal_service::zkgroup::ServerPublicParams,
+    ) -> Result<libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredential, Error<S::Error>>
+    {
+        let mut websocket = self.identified_websocket(false).await?;
+        Ok(websocket
+            .retrieve_expiring_profile_key_credential(
+                &mut rng(),
+                aci,
+                profile_key,
+                server_public_params,
+            )
+            .await?)
+    }
+
+    /// Sends a data message to these members of a group, sealed where their profile keys
+    /// allow, and stores it in the group's thread. For group changes, whose audience isn't the
+    /// group as it is now.
+    async fn send_to_members(
+        &mut self,
+        master_key: &[u8; 32],
+        members: &[Aci],
+        message: DataMessage,
+        timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let mut content_body: ContentBody = message.into();
+        ensure_data_message_timestamp(&mut content_body, timestamp);
+        let mut sender = self.new_message_sender().await?;
+        let sender_certificate = self.sender_certificate().await?;
+        let mut recipients = Vec::new();
+        for member in members {
+            let unidentified_access =
+                self.store
+                    .profile_key(&(*member).into())
+                    .await?
+                    .map(|profile_key| UnidentifiedAccess {
+                        key: profile_key.derive_access_key().to_vec(),
+                        certificate: sender_certificate.clone(),
+                    });
+            recipients.push(((*member).into(), unidentified_access, false));
+        }
+        let results = sender
+            .send_message_to_group(recipients, content_body.clone(), timestamp, false)
+            .await;
+        results
+            .into_iter()
+            .find(|res| match res {
+                Ok(_) | Err(MessageSenderError::NotFound { .. }) => false,
+                Err(_) => true,
+            })
+            .transpose()?;
+        let own = self.state.data.service_ids.aci();
+        let at = chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap();
+        let content = Content {
+            metadata: Metadata {
+                sender: own.into(),
+                destination: own.into(),
+                sender_device: self.state.device_id(),
+                server_guid: None,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body: content_body,
+        };
+        // Straight to the store: our copy of the group is already as the change made it.
+        self.store
+            .save_message(&Thread::Group(*master_key), content)
+            .await?;
+        Ok(())
+    }
+
     /// Sends one message in a group (v2). The `master_key_bytes` is required to have 32 elements.
     ///
     /// This method will automatically update the [DataMessage::expire_timer] if it is set to
@@ -2261,4 +2557,19 @@ mod transfer_archive_tests {
             TransferArchive::ContinueWithoutUpload
         );
     }
+}
+
+/// A change to a group; see [`Manager::change_group`].
+#[derive(Debug, Clone)]
+pub enum GroupEdit {
+    Title(String),
+    /// Empty clears it.
+    Description(String),
+    /// Seconds; 0 turns disappearing messages off.
+    Timer(u32),
+    AddMembers(Vec<Aci>),
+    RemoveMember(Aci),
+    /// Makes a member an administrator, or takes that back.
+    SetAdmin(Aci, bool),
+    Leave,
 }

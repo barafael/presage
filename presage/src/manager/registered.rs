@@ -1307,7 +1307,10 @@ impl<S: Store> Manager<S, Registered> {
         use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        let Some(group) = upsert_group(&self.store, &mut groups_manager, master_key, &0).await?
+        // Read afresh: the change must build on the group's latest revision, and a change
+        // message we missed would leave our copy behind.
+        let Some(group) =
+            upsert_group(&self.store, &mut groups_manager, master_key, &u32::MAX).await?
         else {
             return Err(Error::UnknownGroup);
         };
@@ -1321,8 +1324,15 @@ impl<S: Store> Manager<S, Registered> {
             version: group.revision + 1,
             ..Default::default()
         };
-        // Who hears of it: the members before the change and those added.
+        // Who hears of it: the members and invitees before the change, and those added.
         let mut told: Vec<Aci> = group.members.iter().map(|m| m.aci).collect();
+        told.extend(
+            group
+                .pending_members
+                .iter()
+                .filter(|m| m.service_id_type == crate::model::ServiceIdType::AccountIdentity)
+                .map(|m| Aci::from(m.uuid)),
+        );
         let leaving = matches!(change, GroupEdit::Leave);
         match change {
             GroupEdit::Title(title) => {
@@ -1419,6 +1429,7 @@ impl<S: Store> Manager<S, Registered> {
             ..Default::default()
         };
         told.retain(|member| *member != own);
+        told.sort();
         told.dedup();
         let timestamp = Self::now();
         self.send_to_members(master_key, &told, message, timestamp)
@@ -1454,7 +1465,8 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Sends a data message to these members of a group, sealed where their profile keys
     /// allow, and stores it in the group's thread. For group changes, whose audience isn't the
-    /// group as it is now.
+    /// group as it is now. The change is made by then, so members it couldn't be sent to are
+    /// only logged: their apps learn of it with the group's next message.
     async fn send_to_members(
         &mut self,
         master_key: &[u8; 32],
@@ -1481,13 +1493,12 @@ impl<S: Store> Manager<S, Registered> {
         let results = sender
             .send_message_to_group(recipients, content_body.clone(), timestamp, false)
             .await;
-        results
-            .into_iter()
-            .find(|res| match res {
-                Ok(_) | Err(MessageSenderError::NotFound { .. }) => false,
-                Err(_) => true,
-            })
-            .transpose()?;
+        for result in results {
+            match result {
+                Ok(_) | Err(MessageSenderError::NotFound { .. }) => {}
+                Err(error) => warn!(%error, "failed to tell a member of a group change"),
+            }
+        }
         let own = self.state.data.service_ids.aci();
         let at = chrono::Utc.timestamp_millis_opt(timestamp as i64).unwrap();
         let content = Content {

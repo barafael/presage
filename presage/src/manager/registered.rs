@@ -748,6 +748,21 @@ impl<S: Store> Manager<S, Registered> {
                                         ));
                                     }
 
+                                    // A sync message speaks for our own account (contacts,
+                                    // keys, sticker packs, what we sent or deleted elsewhere),
+                                    // so only our own devices may send one. Anyone else's is
+                                    // forged, and dropped here as Signal's clients drop it.
+                                    if matches!(content.body, ContentBody::SynchronizeMessage(_))
+                                        && content.metadata.sender
+                                            != ServiceId::Aci(state.service_ids.aci())
+                                    {
+                                        warn!(
+                                            sender = %content.metadata.sender.service_id_string(),
+                                            "dropping a sync message from another account"
+                                        );
+                                        continue;
+                                    }
+
                                     if let ContentBody::SynchronizeMessage(SyncMessage {
                                         content: Some(SyncContent::Request(request)),
                                         ..

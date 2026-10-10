@@ -129,6 +129,8 @@ impl<S: Store> Manager<S, Confirmation> {
                 registration_id,
                 pni_registration_id: Some(pni_registration_id),
                 profile_key,
+                // Registering as a primary device; there is no history transfer to key.
+                ephemeral_backup_key: None,
             }),
         };
 

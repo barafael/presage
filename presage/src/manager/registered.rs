@@ -1322,7 +1322,12 @@ impl<S: Store> Manager<S, Registered> {
             }),
             ..Default::default()
         };
-        let recipients: Vec<Aci> = members.iter().copied().filter(|m| *m != own).collect();
+        let recipients: Vec<ServiceId> = members
+            .iter()
+            .copied()
+            .filter(|m| *m != own)
+            .map(ServiceId::Aci)
+            .collect();
         let timestamp = Self::now();
         self.send_to_members(&master_key, &recipients, message, timestamp)
             .await?;
@@ -1401,7 +1406,7 @@ impl<S: Store> Manager<S, Registered> {
             }),
             ..Default::default()
         };
-        told.retain(|member| *member != own);
+        told.retain(|member| *member != ServiceId::Aci(own));
         told.sort();
         told.dedup();
         let timestamp = Self::now();
@@ -1418,7 +1423,13 @@ impl<S: Store> Manager<S, Registered> {
         operations: &libsignal_service::groups_v2::GroupOperations,
         group: &Group,
         change: GroupEdit,
-    ) -> Result<(libsignal_service::proto::group_change::Actions, Vec<Aci>), Error<S::Error>> {
+    ) -> Result<
+        (
+            libsignal_service::proto::group_change::Actions,
+            Vec<ServiceId>,
+        ),
+        Error<S::Error>,
+    > {
         use libsignal_service::groups_v2::Role;
         use libsignal_service::proto::group_change::Actions;
         let decoding =
@@ -1431,13 +1442,17 @@ impl<S: Store> Manager<S, Registered> {
             ..Default::default()
         };
         // Who hears of it: the members and invitees before the change, and those added.
-        let mut told: Vec<Aci> = group.members.iter().map(|m| m.aci).collect();
+        let mut told: Vec<ServiceId> = group.members.iter().map(|m| m.aci.into()).collect();
         told.extend(
             group
                 .pending_members
                 .iter()
-                .filter(|m| m.service_id_type == crate::model::ServiceIdType::AccountIdentity)
-                .map(|m| Aci::from(m.uuid)),
+                .map(|m| match m.service_id_type {
+                    crate::model::ServiceIdType::AccountIdentity => ServiceId::Aci(m.uuid.into()),
+                    crate::model::ServiceIdType::PhoneNumberIdentity => {
+                        ServiceId::Pni(m.uuid.into())
+                    }
+                }),
         );
         match change {
             GroupEdit::Title(title) => {
@@ -1456,13 +1471,16 @@ impl<S: Store> Manager<S, Registered> {
             GroupEdit::AddMembers(members) => {
                 let server_public_params = groups_manager.server_public_params().clone();
                 for member in members {
-                    let key = self.store.profile_key(&member.into()).await?;
-                    let credential = match key {
-                        Some(key) => self
-                            .profile_key_credential(member, key, &server_public_params)
-                            .await
-                            .ok(),
-                        None => None,
+                    // Only an ACI with a profile key we have can be added outright.
+                    let credential = match member {
+                        ServiceId::Aci(aci) => match self.store.profile_key(&member).await? {
+                            Some(key) => self
+                                .profile_key_credential(aci, key, &server_public_params)
+                                .await
+                                .ok(),
+                            None => None,
+                        },
+                        ServiceId::Pni(_) => None,
                     };
                     match credential {
                         Some(credential) => actions.add_members.push(
@@ -1475,7 +1493,7 @@ impl<S: Store> Manager<S, Registered> {
                         // Invited: they join once their app sees it.
                         None => actions.add_members_pending_profile_key.push(
                             operations
-                                .build_add_pending_member_action(member.into(), own, Role::Default)
+                                .build_add_pending_member_action(member, own, Role::Default)
                                 .map_err(decoding)?,
                         ),
                     }
@@ -1582,7 +1600,7 @@ impl<S: Store> Manager<S, Registered> {
     async fn send_to_members(
         &mut self,
         master_key: &[u8; 32],
-        members: &[Aci],
+        members: &[ServiceId],
         message: DataMessage,
         timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
@@ -1594,13 +1612,13 @@ impl<S: Store> Manager<S, Registered> {
         for member in members {
             let unidentified_access =
                 self.store
-                    .profile_key(&(*member).into())
+                    .profile_key(member)
                     .await?
                     .map(|profile_key| UnidentifiedAccess {
                         key: profile_key.derive_access_key().to_vec(),
                         certificate: sender_certificate.clone(),
                     });
-            recipients.push(((*member).into(), unidentified_access, false));
+            recipients.push((*member, unidentified_access, false));
         }
         let results = sender
             .send_message_to_group(recipients, content_body.clone(), timestamp, false)
@@ -2722,7 +2740,9 @@ pub enum GroupEdit {
     Description(String),
     /// Seconds; 0 turns disappearing messages off.
     Timer(u32),
-    AddMembers(Vec<Aci>),
+    /// Adds members we have a profile key for; invites the others. Someone known only by phone
+    /// number (a PNI, from contact discovery) is invited by that.
+    AddMembers(Vec<ServiceId>),
     RemoveMember(Aci),
     /// Makes a member an administrator, or takes that back.
     SetAdmin(Aci, bool),

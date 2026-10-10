@@ -14,10 +14,11 @@ use presage::{
         push_service::DEFAULT_DEVICE_ID,
     },
     model::identity::OnNewIdentity,
-    store::StateStore,
+    proto::verified,
+    store::{StateStore, save_trusted_identity_message},
 };
 use sqlx::{query, query_scalar};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::{SqliteStore, SqliteStoreError, error::SqlxErrorExt};
 
@@ -576,14 +577,24 @@ impl IdentityKeyStore for SqliteProtocolStore {
 
     /// Record an identity into the store. The identity is then considered "trusted".
     ///
-    /// The return value represents whether an existing identity was replaced (`Ok(true)`). If it is
-    /// new or hasn't changed, the return value should be `Ok(false)`.
+    /// Returns [`IdentityChange::ReplacedExisting`] only if a *different* identity was stored for
+    /// this address before, i.e. the contact's safety number changed; a new or unchanged identity
+    /// is [`IdentityChange::NewOrUnchanged`]. On a change, a notice is also saved in the contact's
+    /// thread (see [`save_trusted_identity_message`]).
     async fn save_identity(
         &mut self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
     ) -> Result<IdentityChange, SignalProtocolError> {
-        let address = address.name();
+        // Read before writing, outside the transaction: a transaction that reads and then writes
+        // can fail to take the write lock if another connection wrote in between, which would
+        // fail decryption. A race here can at worst misreport the change.
+        let previous = self.get_identity(address).await?;
+        if previous.as_ref() == Some(identity) {
+            return Ok(IdentityChange::NewOrUnchanged);
+        }
+
+        let name = address.name();
         let bytes = identity.serialize();
 
         let mut tx = self.store.db.begin().await.into_protocol_error()?;
@@ -593,7 +604,7 @@ impl IdentityKeyStore for SqliteProtocolStore {
         let is_replaced = query!(
             "UPDATE identities SET record = ?3
             WHERE address = ?1 AND identity = ?2",
-            address,
+            name,
             self.identity,
             bytes,
         )
@@ -607,7 +618,7 @@ impl IdentityKeyStore for SqliteProtocolStore {
             query!(
                 "INSERT INTO identities (address, identity, record)
                 VALUES (?1, ?2, ?3)",
-                address,
+                name,
                 self.identity,
                 bytes,
             )
@@ -618,11 +629,20 @@ impl IdentityKeyStore for SqliteProtocolStore {
 
         tx.commit().await.into_protocol_error()?;
 
-        Ok(if is_replaced {
-            IdentityChange::ReplacedExisting
-        } else {
-            IdentityChange::NewOrUnchanged
-        })
+        if !is_replaced {
+            return Ok(IdentityChange::NewOrUnchanged);
+        }
+
+        warn!(%address, "identity changed");
+        // The new key starts out unverified: verification is per (contact, key).
+        if let Err(error) =
+            save_trusted_identity_message(&self.store, address, *identity, verified::State::Default)
+                .await
+        {
+            // Losing the notice is better than failing to decrypt the message.
+            error!(%error, %address, "failed to save the identity change notice");
+        }
+        Ok(IdentityChange::ReplacedExisting)
     }
 
     /// Return whether an identity is trusted for the role specified by `direction`.
@@ -727,6 +747,86 @@ mod test {
     use presage::libsignal_service::protocol::{KeyPair, KyberPreKeyStore, Timestamp};
 
     use super::*;
+
+    #[tokio::test]
+    async fn changed_identity_leaves_one_notice() -> Result<(), Box<dyn std::error::Error>> {
+        use presage::{
+            libsignal_service::content::ContentBody,
+            libsignal_service::proto::sync_message::Content as SyncContent,
+            store::{ContentsStore, Thread},
+        };
+
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut store = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        let contact =
+            ServiceId::parse_from_service_id_string("9d0652a3-dcc3-4d11-975f-74d61598733f")
+                .unwrap();
+        let address = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(1).unwrap());
+        let first = *IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+        let second = *IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+
+        store.save_identity(&address, &first).await?;
+        store.save_identity(&address, &first).await?;
+        store.save_identity(&address, &second).await?;
+        store.save_identity(&address, &second).await?;
+
+        let notices: Vec<_> = sqlite_store
+            .messages(&Thread::Contact(contact), ..)
+            .await?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(notices.len(), 1, "one notice, for the one real change");
+        let ContentBody::SynchronizeMessage(sync) = &notices[0].body else {
+            panic!("the notice is a sync message");
+        };
+        let Some(SyncContent::Verified(verified)) = &sync.content else {
+            panic!("the notice is a Verified sync message");
+        };
+        assert_eq!(
+            verified.identity_key.as_deref(),
+            Some(&*second.public_key().serialize()),
+            "it names the new key"
+        );
+        assert_eq!(verified.destination_aci, None, "not a real Verified sync");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn save_identity_reports_only_real_changes() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteProtocolStore {
+            store: SqliteStore::open(":memory:", OnNewIdentity::Trust).await?,
+            identity: IdentityType::Aci,
+        };
+        let address = ProtocolAddress::new(
+            "9d0652a3-dcc3-4d11-975f-74d61598733f".into(),
+            DeviceId::new(1).unwrap(),
+        );
+        let first = *IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+        let second = *IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+
+        // A new contact, then the same key again: nothing was replaced.
+        assert_eq!(
+            store.save_identity(&address, &first).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(
+            store.save_identity(&address, &first).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        // Their key changed (e.g. they reinstalled Signal).
+        assert_eq!(
+            store.save_identity(&address, &second).await?,
+            IdentityChange::ReplacedExisting
+        );
+        assert_eq!(store.get_identity(&address).await?, Some(second));
+        assert_eq!(
+            store.save_identity(&address, &second).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn kyber_pre_keys_mark_used_one_time() -> Result<(), Box<dyn std::error::Error>> {

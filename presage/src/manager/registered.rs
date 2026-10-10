@@ -1331,29 +1331,101 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Changes a group, and tells its members (and anyone removed) with the change as the
     /// server signed it. Returns the time of that message (stored too).
+    ///
+    /// A change builds on the group's latest revision; if someone else changed the group
+    /// meanwhile (the server answers 409), it is read again and the change built anew, a few
+    /// times, as Signal's apps do.
     pub async fn change_group(
         &mut self,
         master_key: &[u8; 32],
         change: GroupEdit,
     ) -> Result<u64, Error<S::Error>> {
-        use libsignal_service::groups_v2::{GroupOperations, Role};
-        use libsignal_service::proto::group_change::Actions;
+        use libsignal_service::groups_v2::GroupOperations;
         use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+        const ATTEMPTS: usize = 3;
 
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
-        // Read afresh: the change must build on the group's latest revision, and a change
-        // message we missed would leave our copy behind.
-        let Some(group) =
-            upsert_group(&self.store, &mut groups_manager, master_key, &u32::MAX).await?
-        else {
-            return Err(Error::UnknownGroup);
-        };
         let operations = GroupOperations::new(GroupSecretParams::derive_from_master_key(
             GroupMasterKey::new(*master_key),
         ));
+        let own = self.state.data.service_ids.aci();
+        let pni = self.state.data.service_ids.pni();
+        let leaving = matches!(change, GroupEdit::Leave | GroupEdit::DeclineInvitation);
+        let mut attempt = 0;
+        let (group, revision, mut told, signed) = loop {
+            attempt += 1;
+            // Read afresh: the change must build on the group's latest revision, and a change
+            // message we missed would leave our copy behind.
+            let Some(group) =
+                upsert_group(&self.store, &mut groups_manager, master_key, &u32::MAX).await?
+            else {
+                return Err(Error::UnknownGroup);
+            };
+            let (actions, told) = self
+                .group_change_actions(&groups_manager, &operations, &group, change.clone())
+                .await?;
+            let revision = actions.version;
+            match groups_manager
+                .modify_group(&mut rng(), master_key, actions)
+                .await
+            {
+                Ok(signed) => break (group, revision, told, signed),
+                Err(error) if is_conflict(&error) && attempt < ATTEMPTS => {
+                    debug!(
+                        attempt,
+                        "the group changed meanwhile; building the change again"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        // Our copy follows; once we left, the server no longer shows it to us, so it is
+        // changed here.
+        if leaving {
+            let mut left = group;
+            left.members.retain(|m| m.aci != own);
+            left.pending_members
+                .retain(|m| m.uuid != Uuid::from(own) && m.uuid != Uuid::from(pni));
+            left.revision = revision;
+            self.store.save_group(*master_key, left).await?;
+        } else {
+            upsert_group(&self.store, &mut groups_manager, master_key, &revision).await?;
+        }
+        let message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(revision),
+                group_change: Some(libsignal_service::prelude::ProtobufMessage::encode_to_vec(
+                    &signed,
+                )),
+            }),
+            ..Default::default()
+        };
+        told.retain(|member| *member != own);
+        told.sort();
+        told.dedup();
+        let timestamp = Self::now();
+        self.send_to_members(master_key, &told, message, timestamp)
+            .await?;
+        Ok(timestamp)
+    }
+
+    /// The actions that make `change` to `group` (as read just now, building on its revision),
+    /// and who hears of it: the members and invitees before the change, and those added.
+    async fn group_change_actions(
+        &self,
+        groups_manager: &GroupsManager<InMemoryCredentialsCache>,
+        operations: &libsignal_service::groups_v2::GroupOperations,
+        group: &Group,
+        change: GroupEdit,
+    ) -> Result<(libsignal_service::proto::group_change::Actions, Vec<Aci>), Error<S::Error>> {
+        use libsignal_service::groups_v2::Role;
+        use libsignal_service::proto::group_change::Actions;
         let decoding =
             |e| Error::ServiceError(libsignal_service::push_service::ServiceError::from(e));
         let own = self.state.data.service_ids.aci();
+        let pni = self.state.data.service_ids.pni();
+        let invited_as = invited_as(group, own, pni);
         let mut actions = Actions {
             version: group.revision + 1,
             ..Default::default()
@@ -1367,9 +1439,6 @@ impl<S: Store> Manager<S, Registered> {
                 .filter(|m| m.service_id_type == crate::model::ServiceIdType::AccountIdentity)
                 .map(|m| Aci::from(m.uuid)),
         );
-        let leaving = matches!(change, GroupEdit::Leave | GroupEdit::DeclineInvitation);
-        let pni = self.state.data.service_ids.pni();
-        let invited_as = invited_as(&group, own, pni);
         match change {
             GroupEdit::Title(title) => {
                 actions.modify_title =
@@ -1477,39 +1546,7 @@ impl<S: Store> Manager<S, Registered> {
                 );
             }
         }
-        let revision = actions.version;
-        let signed = groups_manager
-            .modify_group(&mut rng(), master_key, actions)
-            .await?;
-        // Our copy follows; once we left, the server no longer shows it to us, so it is
-        // changed here.
-        if leaving {
-            let mut left = group;
-            left.members.retain(|m| m.aci != own);
-            left.pending_members
-                .retain(|m| m.uuid != Uuid::from(own) && m.uuid != Uuid::from(pni));
-            left.revision = revision;
-            self.store.save_group(*master_key, left).await?;
-        } else {
-            upsert_group(&self.store, &mut groups_manager, master_key, &revision).await?;
-        }
-        let message = DataMessage {
-            group_v2: Some(GroupContextV2 {
-                master_key: Some(master_key.to_vec()),
-                revision: Some(revision),
-                group_change: Some(libsignal_service::prelude::ProtobufMessage::encode_to_vec(
-                    &signed,
-                )),
-            }),
-            ..Default::default()
-        };
-        told.retain(|member| *member != own);
-        told.sort();
-        told.dedup();
-        let timestamp = Self::now();
-        self.send_to_members(master_key, &told, message, timestamp)
-            .await?;
-        Ok(timestamp)
+        Ok((actions, told))
     }
 
     fn now() -> u64 {
@@ -2644,6 +2681,15 @@ mod transfer_archive_tests {
             TransferArchive::ContinueWithoutUpload
         );
     }
+}
+
+/// Whether a group change was refused because someone else changed the group meanwhile.
+fn is_conflict(error: &libsignal_service::push_service::ServiceError) -> bool {
+    matches!(
+        error,
+        libsignal_service::push_service::ServiceError::UnhandledResponseCode { status, .. }
+            if status.as_u16() == 409
+    )
 }
 
 /// Which of our identities (`aci`, or `pni` if someone invited us by phone number) `group` has

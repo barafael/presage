@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use presage::{
     libsignal_service::{
-        libsignal_account_keys::AccountEntropyPool, prelude::MasterKey, protocol::SenderCertificate,
+        libsignal_account_keys::AccountEntropyPool,
+        prelude::MasterKey,
+        protocol::{IdentityKey, SenderCertificate, ServiceId},
     },
     store::{StateStore, Store},
 };
@@ -30,6 +32,38 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Requires `identity` for sending to `address`, e.g. because the user verified their safety
+    /// number: until [`unpin_identity`](Self::unpin_identity), a different identity of theirs
+    /// isn't trusted for sending, whatever [`OnNewIdentity`] says, so libsignal refuses to
+    /// encrypt to it (an untrusted identity error) rather than send to a key nobody approved.
+    /// Receiving from them isn't affected.
+    pub async fn pin_identity(
+        &self,
+        address: &ServiceId,
+        identity: &IdentityKey,
+    ) -> Result<(), SqliteStoreError> {
+        let address = address.service_id_string();
+        let record = identity.serialize();
+        query!(
+            "INSERT OR REPLACE INTO pinned_identities (address, record) VALUES (?, ?)",
+            address,
+            record,
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// No longer requires a particular identity for sending to `address`; see
+    /// [`pin_identity`](Self::pin_identity).
+    pub async fn unpin_identity(&self, address: &ServiceId) -> Result<(), SqliteStoreError> {
+        let address = address.service_id_string();
+        query!("DELETE FROM pinned_identities WHERE address = ?", address)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     pub async fn open(
         url: &str,
         trust_new_identities: OnNewIdentity,

@@ -12,7 +12,9 @@ default = []
 cdsi = ["libsignal-service/cdsi"]
 
 [dependencies]
-libsignal-service = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "7aa49095efc0627aa7a59c34ef9d98042c35731b", default-features = false, features = [
+# TEMPORARY: the group calls are in whisperfish/libsignal-service-rs#473, not merged yet.
+# Pinned to that PR's head on the author's fork; back to an upstream revision once it lands.
+libsignal-service = { git = "https://github.com/barafael/libsignal-service-rs", rev = "1eb354e03edbf654ae85463e3452072a514f1a2d", default-features = false, features = [
     "phonenumber",
 ] }
 

@@ -1690,6 +1690,30 @@ impl<S: Store> Manager<S, Registered> {
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
     }
 
+    /// Removes this linked device from the account, e.g. before linking again.
+    pub async fn unlink_self(&self) -> Result<(), Error<S::Error>> {
+        let device_id = self.device_id();
+        let response = self
+            .identified_push_service()
+            .request(
+                reqwest::Method::DELETE,
+                Endpoint::service(format!("/v1/devices/{}", u8::from(device_id))),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await
+            .map_err(ServiceError::from)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ServiceError::UnhandledResponseCode {
+                status: response.status(),
+                body: response.text().await.unwrap_or_default(),
+            }
+            .into())
+        }
+    }
+
     /// Waits up to `timeout` for the primary device to upload the history archive; `Ok(None)`
     /// if it hasn't yet. Keep `timeout` well below the HTTP client's 65 seconds.
     pub async fn transfer_archive(

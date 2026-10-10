@@ -9,7 +9,9 @@ use std::fmt;
 
 pub use self::confirmation::Confirmation;
 pub use self::linking::Linking;
-pub use self::registered::{Registered, RegistrationData, RegistrationType, TransferArchive};
+pub use self::registered::{
+    GroupEdit, Registered, RegistrationData, RegistrationType, TransferArchive,
+};
 pub use self::registration::{Registration, RegistrationOptions};
 
 /// Signal manager

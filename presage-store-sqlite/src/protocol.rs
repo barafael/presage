@@ -18,7 +18,7 @@ use presage::{
     store::{StateStore, save_trusted_identity_message},
 };
 use sqlx::{query, query_scalar};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::{SqliteStore, SqliteStoreError, error::SqlxErrorExt};
 
@@ -35,7 +35,134 @@ pub(crate) enum IdentityType {
     Pni,
 }
 
+impl SqliteProtocolStore {
+    /// The identity of `address` as known to our identity `identity`.
+    async fn load_identity(
+        &self,
+        identity: IdentityType,
+        address: &ProtocolAddress,
+    ) -> Result<Option<IdentityKey>, SignalProtocolError> {
+        let address = address.name();
+        query_scalar!(
+            "SELECT record FROM identities
+            WHERE address = ? AND identity = ?",
+            address,
+            identity,
+        )
+        .fetch_optional(&self.store.db)
+        .await
+        .into_protocol_error()?
+        .map(|bytes| IdentityKey::decode(&bytes))
+        .transpose()
+    }
+
+    /// Stores `address`'s identity for our identity, replacing whatever was there.
+    async fn store_identity(
+        &self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Result<(), SignalProtocolError> {
+        let address = address.name();
+        let bytes = identity.serialize();
+
+        let mut tx = self.store.db.begin().await.into_protocol_error()?;
+
+        // Note: It is faster to do the update in a separate query and only insert the record if
+        // the update did not do anything.
+        let is_replaced = query!(
+            "UPDATE identities SET record = ?3
+            WHERE address = ?1 AND identity = ?2",
+            address,
+            self.identity,
+            bytes,
+        )
+        .execute(&mut *tx)
+        .await
+        .into_protocol_error()?
+        .rows_affected()
+            != 0;
+
+        if !is_replaced {
+            query!(
+                "INSERT INTO identities (address, identity, record)
+                VALUES (?1, ?2, ?3)",
+                address,
+                self.identity,
+                bytes,
+            )
+            .execute(&mut *tx)
+            .await
+            .into_protocol_error()?;
+        }
+
+        tx.commit().await.into_protocol_error().map(drop)
+    }
+
+    /// Replaces `address`'s identity for our identity `identity` with `new`, if it still is
+    /// `old`; returns whether it was.
+    async fn replace_identity(
+        &self,
+        identity: IdentityType,
+        address: &ProtocolAddress,
+        old: &IdentityKey,
+        new: &IdentityKey,
+    ) -> Result<bool, SignalProtocolError> {
+        let address = address.name();
+        let (old, new) = (old.serialize(), new.serialize());
+        query!(
+            "UPDATE identities SET record = ?4
+            WHERE address = ?1 AND identity = ?2 AND record = ?3",
+            address,
+            identity,
+            old,
+            new,
+        )
+        .execute(&self.store.db)
+        .await
+        .into_protocol_error()
+        .map(|done| done.rows_affected() != 0)
+    }
+
+    /// Whether saving `offered` instead of the `stored` identity is libsignal encrypting with a
+    /// stale session rather than a real change: we have sessions with `address`'s devices on
+    /// both keys. When their key really changes, the session bringing the new one isn't stored
+    /// yet. Once the server has had us drop sessions to devices that are gone, a stored key
+    /// that has gone stale gives way.
+    async fn is_stale_session(
+        &self,
+        address: &ProtocolAddress,
+        stored: &IdentityKey,
+        offered: &IdentityKey,
+    ) -> Result<bool, SignalProtocolError> {
+        let Some(service_id) = ServiceId::parse_from_service_id_string(address.name()) else {
+            return Ok(false);
+        };
+        let mut devices = self.get_sub_device_sessions(&service_id).await?;
+        devices.push(*DEFAULT_DEVICE_ID);
+        let (stored, offered) = (stored.serialize(), offered.serialize());
+        let (mut on_stored, mut on_offered) = (false, false);
+        for device in devices {
+            let device = ProtocolAddress::new(address.name().to_owned(), device);
+            let Some(session) = self.load_session(&device).await? else {
+                continue;
+            };
+            let key = session.remote_identity_key_bytes()?;
+            on_stored |= key.as_deref() == Some(&*stored);
+            on_offered |= key.as_deref() == Some(&*offered);
+        }
+        Ok(on_stored && on_offered)
+    }
+}
+
 impl IdentityType {
+    /// Our other identity: a contact's identity key is the same for both.
+    fn other(self) -> Self {
+        match self {
+            Self::Aci => Self::Pni,
+            Self::Pni => Self::Aci,
+        }
+    }
+
     pub(crate) fn identity_key_pair_key(&self) -> &'static str {
         match self {
             Self::Aci => "identity_keypair_aci",
@@ -577,60 +704,57 @@ impl IdentityKeyStore for SqliteProtocolStore {
 
     /// Record an identity into the store. The identity is then considered "trusted".
     ///
-    /// Returns [`IdentityChange::ReplacedExisting`] only if a *different* identity was stored for
-    /// this address before, i.e. the contact's safety number changed; a new or unchanged identity
-    /// is [`IdentityChange::NewOrUnchanged`]. On a change, a notice is also saved in the contact's
-    /// thread (see [`save_trusted_identity_message`]).
+    /// Returns [`IdentityChange::ReplacedExisting`] only if the contact's identity really
+    /// changed, i.e. their safety number did; then a notice is also saved in their thread (see
+    /// [`save_trusted_identity_message`]), once per change. A contact has one identity, whichever
+    /// of ours (ACI or PNI) they write to, so both are kept the same.
+    ///
+    /// libsignal also saves the identity of each session it encrypts with. A session to one of
+    /// their old devices (still on their old key, until the server tells us the device is gone)
+    /// would switch the stored key back and forth; that is recognised and ignored, see
+    /// [`Self::is_stale_session`].
     async fn save_identity(
         &mut self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
     ) -> Result<IdentityChange, SignalProtocolError> {
-        // Read before writing, outside the transaction: a transaction that reads and then writes
+        // Read before writing, outside a transaction: a transaction that reads and then writes
         // can fail to take the write lock if another connection wrote in between, which would
-        // fail decryption. A race here can at worst misreport the change.
-        let previous = self.get_identity(address).await?;
-        if previous.as_ref() == Some(identity) {
+        // fail decryption. The write below only replaces the key it read.
+        let ours = self.load_identity(self.identity, address).await?;
+        let theirs = self.load_identity(self.identity.other(), address).await?;
+
+        // New, unchanged, or a change already noted when our other identity saw it.
+        let known = match ours.or(theirs) {
+            Some(known) if ours != Some(*identity) && theirs != Some(*identity) => known,
+            _ => {
+                if ours != Some(*identity) {
+                    self.store_identity(address, identity).await?;
+                }
+                return Ok(IdentityChange::NewOrUnchanged);
+            }
+        };
+
+        if self.is_stale_session(address, &known, identity).await? {
+            debug!(%address, "not switching back to the identity of a stale session");
             return Ok(IdentityChange::NewOrUnchanged);
         }
 
-        let name = address.name();
-        let bytes = identity.serialize();
-
-        let mut tx = self.store.db.begin().await.into_protocol_error()?;
-
-        // Note: It is faster to do the update in a separate query and only insert the record if
-        // the update did not do anything.
-        let is_replaced = query!(
-            "UPDATE identities SET record = ?3
-            WHERE address = ?1 AND identity = ?2",
-            name,
-            self.identity,
-            bytes,
-        )
-        .execute(&mut *tx)
-        .await
-        .into_protocol_error()?
-        .rows_affected()
-            != 0;
-
-        if !is_replaced {
-            query!(
-                "INSERT INTO identities (address, identity, record)
-                VALUES (?1, ?2, ?3)",
-                name,
-                self.identity,
-                bytes,
-            )
-            .execute(&mut *tx)
-            .await
-            .into_protocol_error()?;
+        match ours {
+            // Only if it still is what we read: of two saving the same change, one notes it.
+            Some(ours) => {
+                if !self
+                    .replace_identity(self.identity, address, &ours, identity)
+                    .await?
+                {
+                    return Ok(IdentityChange::NewOrUnchanged);
+                }
+            }
+            None => self.store_identity(address, identity).await?,
         }
-
-        tx.commit().await.into_protocol_error()?;
-
-        if !is_replaced {
-            return Ok(IdentityChange::NewOrUnchanged);
+        if let Some(theirs) = theirs {
+            self.replace_identity(self.identity.other(), address, &theirs, identity)
+                .await?;
         }
 
         warn!(%address, "identity changed");
@@ -674,18 +798,7 @@ impl IdentityKeyStore for SqliteProtocolStore {
         &self,
         address: &ProtocolAddress,
     ) -> Result<Option<IdentityKey>, SignalProtocolError> {
-        let address = address.name();
-        query_scalar!(
-            "SELECT record FROM identities
-            WHERE address = ? AND identity = ?",
-            address,
-            self.identity,
-        )
-        .fetch_optional(&self.store.db)
-        .await
-        .into_protocol_error()?
-        .map(|bytes| IdentityKey::decode(&bytes))
-        .transpose()
+        self.load_identity(self.identity, address).await
     }
 }
 
@@ -747,6 +860,243 @@ mod test {
     use presage::libsignal_service::protocol::{KeyPair, KyberPreKeyStore, Timestamp};
 
     use super::*;
+
+    /// A session with `their` identity on `remote`, made the way fetching their pre-key bundle
+    /// makes one, and stored in `store`.
+    async fn store_session_with(
+        store: &mut SqliteProtocolStore,
+        remote: &ProtocolAddress,
+        their: &IdentityKeyPair,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use presage::libsignal_service::protocol::{
+            InMemSignalProtocolStore, PreKeyBundle, kem, process_prekey_bundle,
+        };
+        let mut rng = rand::rng();
+        let pre_key = KeyPair::generate(&mut rng);
+        let signed = KeyPair::generate(&mut rng);
+        let signed_signature = their
+            .private_key()
+            .calculate_signature(&signed.public_key.serialize(), &mut rng)?;
+        let kyber = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
+        let kyber_signature = their
+            .private_key()
+            .calculate_signature(&kyber.public_key.serialize(), &mut rng)?;
+        let bundle = PreKeyBundle::new(
+            7,
+            remote.device_id(),
+            Some((1.into(), pre_key.public_key)),
+            2.into(),
+            signed.public_key,
+            signed_signature.to_vec(),
+            3.into(),
+            kyber.public_key,
+            kyber_signature.to_vec(),
+            *their.identity_key(),
+        )?;
+        let mut us = InMemSignalProtocolStore::new(IdentityKeyPair::generate(&mut rng), 1)?;
+        let local = ProtocolAddress::new("us".into(), DeviceId::new(1).unwrap());
+        process_prekey_bundle(
+            remote,
+            &local,
+            &mut us.session_store,
+            &mut us.identity_store,
+            &bundle,
+            std::time::SystemTime::now(),
+            &mut rng,
+        )
+        .await?;
+        let record = us.load_session(remote).await?.expect("a session");
+        store.store_session(remote, &record).await?;
+        Ok(())
+    }
+
+    async fn notices(store: &SqliteStore, contact: ServiceId) -> usize {
+        use presage::store::{ContentsStore, Thread};
+        store
+            .messages(&Thread::Contact(contact), ..)
+            .await
+            .unwrap()
+            .count()
+    }
+
+    /// The notice never takes the place of a message stored at the same millisecond.
+    #[tokio::test]
+    async fn the_notice_does_not_replace_a_message() -> Result<(), Box<dyn std::error::Error>> {
+        use presage::{
+            libsignal_service::content::{Content, ContentBody, Metadata},
+            proto::DataMessage,
+            store::{ContentsStore, Thread},
+        };
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut store = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        let contact =
+            ServiceId::parse_from_service_id_string("9d0652a3-dcc3-4d11-975f-74d61598733f")
+                .unwrap();
+        let address = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(1).unwrap());
+        let thread = Thread::Contact(contact);
+        store
+            .save_identity(
+                &address,
+                IdentityKeyPair::generate(&mut rand::rng()).identity_key(),
+            )
+            .await?;
+        // A message at every millisecond of a window starting two seconds from now; once it has
+        // begun, the notice's moment is taken.
+        let start = chrono::Utc::now().timestamp_millis() + 2000;
+        const WINDOW: i64 = 300;
+        let sqlite = sqlite_store.clone();
+        for at in start..start + WINDOW {
+            let at = chrono::DateTime::from_timestamp_millis(at).unwrap();
+            let message = Content {
+                metadata: Metadata {
+                    sender: contact,
+                    destination: contact,
+                    sender_device: DeviceId::new(1).unwrap(),
+                    server_guid: None,
+                    client_timestamp: at,
+                    server_timestamp: at,
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    was_plaintext: false,
+                    pni_verified: None,
+                },
+                body: ContentBody::DataMessage(DataMessage {
+                    body: Some("busy".into()),
+                    ..Default::default()
+                }),
+            };
+            sqlite.save_message(&thread, message).await?;
+        }
+        let wait = start + 10 - chrono::Utc::now().timestamp_millis();
+        assert!(
+            wait > 0,
+            "filling the window took too long for the test to mean anything"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(wait as u64)).await;
+        store
+            .save_identity(
+                &address,
+                IdentityKeyPair::generate(&mut rand::rng()).identity_key(),
+            )
+            .await?;
+        assert_eq!(
+            notices(&sqlite_store, contact).await,
+            WINDOW as usize + 1,
+            "the messages and the notice"
+        );
+        Ok(())
+    }
+
+    /// Sending through a session to one of their old devices (still on their old key) must not
+    /// switch the stored key back, nor report a change: the old key isn't new.
+    #[tokio::test]
+    async fn a_stale_session_does_not_switch_the_identity_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut store = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        let contact =
+            ServiceId::parse_from_service_id_string("9d0652a3-dcc3-4d11-975f-74d61598733f")
+                .unwrap();
+        let phone = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(1).unwrap());
+        let laptop = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(2).unwrap());
+        let old = IdentityKeyPair::generate(&mut rand::rng());
+        let new = IdentityKeyPair::generate(&mut rand::rng());
+
+        // Their laptop, on the old key; then a message from their reinstalled phone.
+        store_session_with(&mut store, &laptop, &old).await?;
+        store.save_identity(&laptop, old.identity_key()).await?;
+        assert_eq!(
+            store.save_identity(&phone, new.identity_key()).await?,
+            IdentityChange::ReplacedExisting
+        );
+        // Decrypting it stores the phone's new session.
+        store_session_with(&mut store, &phone, &new).await?;
+        // We answer: encrypting for the laptop's stale session saves its (old) key.
+        assert_eq!(
+            store.save_identity(&laptop, old.identity_key()).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(store.get_identity(&phone).await?, Some(*new.identity_key()));
+        assert_eq!(notices(&sqlite_store, contact).await, 1);
+        Ok(())
+    }
+
+    /// If the stored key went stale anyway (as it could before stale sessions were recognised),
+    /// it gives way once the server has had us drop the stale session.
+    #[tokio::test]
+    async fn a_stale_stored_identity_gives_way() -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut store = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        let contact =
+            ServiceId::parse_from_service_id_string("9d0652a3-dcc3-4d11-975f-74d61598733f")
+                .unwrap();
+        let phone = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(1).unwrap());
+        let laptop = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(2).unwrap());
+        let old = IdentityKeyPair::generate(&mut rand::rng());
+        let new = IdentityKeyPair::generate(&mut rand::rng());
+
+        // Stored: the old key, with sessions on both.
+        store_session_with(&mut store, &laptop, &old).await?;
+        store_session_with(&mut store, &phone, &new).await?;
+        store.save_identity(&laptop, old.identity_key()).await?;
+        // Ambiguous while both sessions exist: the stored key stays.
+        store.save_identity(&phone, new.identity_key()).await?;
+        assert_eq!(store.get_identity(&phone).await?, Some(*old.identity_key()));
+        // The laptop is gone (the server answered 409/410 and its session was dropped).
+        store.delete_session(&laptop).await?;
+        assert_eq!(
+            store.save_identity(&phone, new.identity_key()).await?,
+            IdentityChange::ReplacedExisting
+        );
+        assert_eq!(store.get_identity(&phone).await?, Some(*new.identity_key()));
+        Ok(())
+    }
+
+    /// A contact is known to both of our identities (ACI and PNI) with the same key; one change
+    /// of their key is one notice, whichever of our identities sees it first or later.
+    #[tokio::test]
+    async fn a_change_seen_by_both_our_identities_is_noted_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sqlite_store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let mut aci = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Aci,
+        };
+        let mut pni = SqliteProtocolStore {
+            store: sqlite_store.clone(),
+            identity: IdentityType::Pni,
+        };
+        let contact =
+            ServiceId::parse_from_service_id_string("9d0652a3-dcc3-4d11-975f-74d61598733f")
+                .unwrap();
+        let address = ProtocolAddress::new(contact.service_id_string(), DeviceId::new(1).unwrap());
+        let old = *IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+        let new = *IdentityKeyPair::generate(&mut rand::rng()).identity_key();
+
+        aci.save_identity(&address, &old).await?;
+        pni.save_identity(&address, &old).await?;
+        assert_eq!(
+            aci.save_identity(&address, &new).await?,
+            IdentityChange::ReplacedExisting
+        );
+        // Weeks later they write to our PNI.
+        assert_eq!(
+            pni.save_identity(&address, &new).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(pni.get_identity(&address).await?, Some(new));
+        assert_eq!(notices(&sqlite_store, contact).await, 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn changed_identity_leaves_one_notice() -> Result<(), Box<dyn std::error::Error>> {

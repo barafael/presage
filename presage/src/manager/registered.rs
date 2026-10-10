@@ -1290,7 +1290,9 @@ impl<S: Store> Manager<S, Registered> {
                 .filter(|m| m.service_id_type == crate::model::ServiceIdType::AccountIdentity)
                 .map(|m| Aci::from(m.uuid)),
         );
-        let leaving = matches!(change, GroupEdit::Leave);
+        let leaving = matches!(change, GroupEdit::Leave | GroupEdit::DeclineInvitation);
+        let pni = self.state.data.service_ids.pni();
+        let invited_as = invited_as(&group, own, pni);
         match change {
             GroupEdit::Title(title) => {
                 actions.modify_title =
@@ -1360,6 +1362,43 @@ impl<S: Store> Manager<S, Registered> {
                         .map_err(decoding)?,
                 );
             }
+            GroupEdit::AcceptInvitation => {
+                use libsignal_service::proto::group_change::actions::{
+                    PromoteMemberPendingPniAciProfileKeyAction,
+                    PromoteMemberPendingProfileKeyAction,
+                };
+                let invited_as = invited_as.ok_or(Error::NotInvited)?;
+                // The server takes who we are and our profile key from the presentation.
+                let server_public_params = groups_manager.server_public_params().clone();
+                let credential = self
+                    .profile_key_credential(own, self.state.data.profile_key, &server_public_params)
+                    .await?;
+                let presentation =
+                    operations.create_member_presentation(&server_public_params, &credential);
+                match invited_as {
+                    ServiceId::Aci(_) => actions.promote_members_pending_profile_key.push(
+                        PromoteMemberPendingProfileKeyAction {
+                            presentation,
+                            ..Default::default()
+                        },
+                    ),
+                    // Invited by phone number: joining tells them our ACI too.
+                    ServiceId::Pni(_) => actions.promote_members_pending_pni_aci_profile_key.push(
+                        PromoteMemberPendingPniAciProfileKeyAction {
+                            presentation,
+                            ..Default::default()
+                        },
+                    ),
+                }
+            }
+            GroupEdit::DeclineInvitation => {
+                let invited_as = invited_as.ok_or(Error::NotInvited)?;
+                actions.delete_members_pending_profile_key.push(
+                    operations
+                        .build_remove_pending_member_action(invited_as)
+                        .map_err(decoding)?,
+                );
+            }
         }
         let revision = actions.version;
         let signed = groups_manager
@@ -1370,6 +1409,8 @@ impl<S: Store> Manager<S, Registered> {
         if leaving {
             let mut left = group;
             left.members.retain(|m| m.aci != own);
+            left.pending_members
+                .retain(|m| m.uuid != Uuid::from(own) && m.uuid != Uuid::from(pni));
             left.revision = revision;
             self.store.save_group(*master_key, left).await?;
         } else {
@@ -2394,6 +2435,28 @@ async fn register_pre_keys<S: Store>(
     Ok(())
 }
 
+/// Which of our identities (`aci`, or `pni` if someone invited us by phone number) `group` has
+/// an invitation for, if any.
+fn invited_as(
+    group: &crate::model::groups::Group,
+    aci: Aci,
+    pni: libsignal_service::protocol::Pni,
+) -> Option<ServiceId> {
+    use crate::model::ServiceIdType;
+    group
+        .pending_members
+        .iter()
+        .find_map(|m| match m.service_id_type {
+            ServiceIdType::AccountIdentity if m.uuid == Uuid::from(aci) => {
+                Some(ServiceId::Aci(aci))
+            }
+            ServiceIdType::PhoneNumberIdentity if m.uuid == Uuid::from(pni) => {
+                Some(ServiceId::Pni(pni))
+            }
+            _ => None,
+        })
+}
+
 /// A change to a group; see [`Manager::change_group`].
 #[derive(Debug, Clone)]
 pub enum GroupEdit {
@@ -2407,4 +2470,65 @@ pub enum GroupEdit {
     /// Makes a member an administrator, or takes that back.
     SetAdmin(Aci, bool),
     Leave,
+    /// Joins a group we were invited to (by our ACI, or by our PNI by someone who only had our
+    /// phone number).
+    AcceptInvitation,
+    /// Turns an invitation down.
+    DeclineInvitation,
+}
+
+#[cfg(test)]
+mod invitation_tests {
+    use super::*;
+    use crate::model::{
+        groups::{Group, PendingMember},
+        ServiceIdType,
+    };
+
+    fn pending(uuid: Uuid, service_id_type: ServiceIdType) -> PendingMember {
+        PendingMember {
+            uuid,
+            service_id_type,
+            role: libsignal_service::groups_v2::Role::Default,
+            added_by_aci: Aci::from(Uuid::from_u128(9)),
+            timestamp: 0,
+        }
+    }
+
+    /// An invitation is found for our ACI, or for our PNI when someone invited our phone
+    /// number; anyone else's isn't ours.
+    #[test]
+    fn finds_our_invitation_by_either_identity() {
+        let aci = Aci::from(Uuid::from_u128(1));
+        let pni = libsignal_service::protocol::Pni::from(Uuid::from_u128(2));
+        let group = |pending_members| Group {
+            title: String::new(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 0,
+            members: vec![],
+            pending_members,
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+        };
+        assert_eq!(invited_as(&group(vec![]), aci, pni), None);
+        let by_aci = group(vec![pending(
+            Uuid::from_u128(1),
+            ServiceIdType::AccountIdentity,
+        )]);
+        assert_eq!(invited_as(&by_aci, aci, pni), Some(ServiceId::Aci(aci)));
+        let by_pni = group(vec![pending(
+            Uuid::from_u128(2),
+            ServiceIdType::PhoneNumberIdentity,
+        )]);
+        assert_eq!(invited_as(&by_pni, aci, pni), Some(ServiceId::Pni(pni)));
+        // Our ACI's UUID as someone's PNI (or the other way round) isn't us.
+        let mixed = group(vec![
+            pending(Uuid::from_u128(1), ServiceIdType::PhoneNumberIdentity),
+            pending(Uuid::from_u128(3), ServiceIdType::AccountIdentity),
+        ]);
+        assert_eq!(invited_as(&mixed, aci, pni), None);
+    }
 }

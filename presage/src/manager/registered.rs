@@ -154,6 +154,16 @@ pub struct RegistrationData {
     pub pni_registration_id: Option<u32>,
     #[serde(with = "serde_profile_key")]
     pub(crate) profile_key: ProfileKey,
+    /// One-time key for the link-time message history transfer ("link and sync"). Set only
+    /// just after linking as a secondary device, and only when the primary device chose to
+    /// send message history. It decrypts the archive the primary then uploads (fetched with
+    /// `GET /v1/devices/transfer_archive`).
+    ///
+    /// Not persisted (`#[serde(skip)]`): the transfer happens in the same session as linking,
+    /// and the key is a one-time secret with no use afterwards, so there is no reason to write
+    /// it to the store.
+    #[serde(skip)]
+    pub(crate) ephemeral_backup_key: Option<[u8; 32]>,
 }
 
 impl RegistrationData {
@@ -165,6 +175,15 @@ impl RegistrationData {
     /// The name of the device (if linked as secondary)
     pub fn device_name(&self) -> Option<&str> {
         self.device_name.as_deref()
+    }
+
+    /// The one-time message-history transfer key from linking, if the primary device sent one.
+    ///
+    /// Only ever `Some` on the [`Manager`] returned by
+    /// [`Manager::link_secondary_device`][crate::Manager::link_secondary_device], and only when
+    /// the primary device offered the transfer. See the field docs for details.
+    pub fn ephemeral_backup_key(&self) -> Option<[u8; 32]> {
+        self.ephemeral_backup_key
     }
 }
 

@@ -56,6 +56,7 @@ impl SqliteProtocolStore {
     }
 
     
+    
     async fn store_identity(
         &self,
         address: &ProtocolAddress,
@@ -64,7 +65,7 @@ impl SqliteProtocolStore {
         let address = address.name();
         let bytes = identity.serialize();
 
-        let mut tx = self.store.db.begin().await.into_protocol_error()?;
+        let mut tx = self.store.begin_write().await.into_protocol_error()?;
 
         // Note: It is faster to do the update in a separate query and only insert the record if
         // the update did not do anything.
@@ -217,7 +218,7 @@ impl SessionStore for SqliteProtocolStore {
         let address = address.name();
         let record = record.serialize()?;
 
-        let mut transaction = self.store.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.store.begin_write().await.into_protocol_error()?;
 
         // Note: It is faster to do the update in a separate query and only insert the record if
         // the update did not do anything.
@@ -550,7 +551,7 @@ impl KyberPreKeyStore for SqliteProtocolStore {
         ec_prekey_id: SignedPreKeyId,
         base_key: &PublicKey,
     ) -> Result<(), SignalProtocolError> {
-        let mut transaction = self.store.db.begin().await.into_protocol_error()?;
+        let mut transaction = self.store.begin_write().await.into_protocol_error()?;
 
         let kyber_prekey_id: u32 = kyber_prekey_id.into();
 

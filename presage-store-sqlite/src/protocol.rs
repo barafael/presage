@@ -55,8 +55,6 @@ impl SqliteProtocolStore {
         .transpose()
     }
 
-    
-    
     async fn store_identity(
         &self,
         address: &ProtocolAddress,
@@ -109,7 +107,7 @@ impl SqliteProtocolStore {
     ) -> Result<bool, SignalProtocolError> {
         let address = address.name();
         let (old, new) = (old.serialize(), new.serialize());
-        query!(
+        let replaced = query!(
             "UPDATE identities SET record = ?4
             WHERE address = ?1 AND identity = ?2 AND record = ?3",
             address,
@@ -119,8 +117,13 @@ impl SqliteProtocolStore {
         )
         .execute(&self.store.db)
         .await
-        .into_protocol_error()
-        .map(|done| done.rows_affected() != 0)
+        .into_protocol_error()?
+        .rows_affected()
+            != 0;
+        if replaced {
+            self.forget_offered(address).await?;
+        }
+        Ok(replaced)
     }
 
     /// Sessions on both keys mean libsignal is encrypting with a stale session, not that the
@@ -1327,6 +1330,20 @@ mod test {
         );
         assert_eq!(sqlite_store.offered_identity(&contact).await?, None);
         assert_eq!(store.get_identity(&address).await?, Some(other));
+        refuse(verified).await?;
+        assert_eq!(
+            sqlite_store.offered_identity(&contact).await?,
+            Some(verified)
+        );
+        assert_eq!(
+            store.save_identity(&address, &other).await?,
+            IdentityChange::NewOrUnchanged
+        );
+        assert_eq!(
+            sqlite_store.offered_identity(&contact).await?,
+            Some(verified),
+            "saving what they have changes nothing"
+        );
         Ok(())
     }
 

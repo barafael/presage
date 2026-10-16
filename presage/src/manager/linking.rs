@@ -77,7 +77,7 @@ impl<S: Store> Manager<S, Linking> {
         let mut signaling_key = [0u8; 52];
         rng.fill_bytes(&mut signaling_key);
 
-        let push_service = PushService::new(signal_servers, None, crate::USER_AGENT);
+        let push_service = PushService::new(signal_servers.clone(), None, crate::USER_AGENT);
 
         let (tx, mut rx) = mpsc::channel(1);
 

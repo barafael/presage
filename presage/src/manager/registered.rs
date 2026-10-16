@@ -107,7 +107,7 @@ impl Registered {
     }
 
     fn servers(&self) -> SignalServers {
-        self.data.signal_servers
+        self.data.signal_servers.clone()
     }
 
     fn service_configuration(&self) -> ServiceConfiguration {

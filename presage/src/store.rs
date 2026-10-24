@@ -137,6 +137,20 @@ pub trait ContentsStore: Send + Sync {
         message: Content,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
+    /// Save many messages as [`Self::save_message`] would one by one. Stores may write
+    /// them in one transaction, which is much faster when importing history.
+    fn save_messages(
+        &self,
+        messages: impl IntoIterator<Item = (Thread, Content)>,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> {
+        async move {
+            for (thread, message) in messages {
+                self.save_message(&thread, message).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Delete a single message, identified by its received timestamp from a thread.
     /// Useful when you want to delete a message locally only.
     fn delete_message(

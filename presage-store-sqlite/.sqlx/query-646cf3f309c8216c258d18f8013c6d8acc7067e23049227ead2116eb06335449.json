@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                ts AS \"ts: _\",\n                server_ts AS \"server_ts: _\",\n                sender_service_id,\n                sender_device_id AS \"sender_device_id: _\",\n                destination_service_id,\n                needs_receipt,\n                unidentified_sender,\n                content_body,\n                was_plaintext,\n                pni_verified\n            FROM thread_messages\n            WHERE thread_id = (\n                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)\n                AND coalesce(ts > ?, ts >= ?, true)\n                AND coalesce(ts < ?, ts <= ?, true)\n            ORDER BY ts DESC",
+  "query": "SELECT\n                ts AS \"ts: _\",\n                server_ts AS \"server_ts: _\",\n                sender_service_id,\n                sender_device_id AS \"sender_device_id: _\",\n                destination_service_id,\n                needs_receipt,\n                unidentified_sender,\n                content_body,\n                was_plaintext,\n                pni_verified\n            FROM thread_messages\n            WHERE thread_id = (\n                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)\n                AND ts >= ? AND ts <= ?\n            ORDER BY ts DESC",
   "describe": {
     "columns": [
       {
@@ -115,7 +115,7 @@
       }
     ],
     "parameters": {
-      "Right": 6
+      "Right": 4
     },
     "nullable": [
       false,
@@ -130,5 +130,5 @@
       true
     ]
   },
-  "hash": "dc394b6d7920e42ed0d71b26cc3a99d11dd032c88bf11c98406544a246fed223"
+  "hash": "646cf3f309c8216c258d18f8013c6d8acc7067e23049227ead2116eb06335449"
 }

@@ -1284,6 +1284,34 @@ mod test {
     }
 
     #[tokio::test]
+    async fn messages_before_uses_the_thread_index() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        // Same filter, order and limit as `messages_before`.
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT * FROM thread_messages
+            WHERE thread_id = (
+                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
+                AND ts < ?
+            ORDER BY ts DESC
+            LIMIT ?",
+        )
+        .fetch_all(&store.db)
+        .await?
+        .iter()
+        .map(|row| row.get("detail"))
+        .collect();
+        assert!(
+            plan.iter().any(|step| step
+                .contains("USING INDEX thread_messages_thread_ts (thread_id=? AND ts<?)")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn save_messages_equals_saving_one_by_one() -> Result<(), Box<dyn std::error::Error>> {
         let alice = ServiceId::Aci(Uuid::from_u128(1).into());

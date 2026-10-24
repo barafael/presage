@@ -112,55 +112,63 @@ impl ContentsStore for SqliteStore {
     async fn save_message(
         &self,
         thread: &Thread,
-        Content { metadata, body }: Content,
+        message: Content,
+    ) -> Result<(), Self::ContentsStoreError> {
+        self.save_messages([(thread.clone(), message)]).await
+    }
+
+    async fn save_messages(
+        &self,
+        messages: impl IntoIterator<Item = (Thread, Content)>,
     ) -> Result<(), Self::ContentsStoreError> {
         let mut tx = self.begin_write().await?;
 
-        let thread_id = match thread {
-            Thread::Contact(service_id) => {
-                let uuid = service_id.raw_uuid();
-                query_scalar!(
-                    "INSERT INTO threads(recipient_id, group_master_key) VALUES (?1, NULL)
+        for (thread, Content { metadata, body }) in messages {
+            let thread_id = match &thread {
+                Thread::Contact(service_id) => {
+                    let uuid = service_id.raw_uuid();
+                    query_scalar!(
+                        "INSERT INTO threads(recipient_id, group_master_key) VALUES (?1, NULL)
                     ON CONFLICT DO UPDATE SET recipient_id = ?1 RETURNING id",
-                    uuid,
-                )
-                .fetch_one(&mut *tx)
-                .await?
-            }
-            Thread::Group(master_key_bytes) => {
-                let master_key_bytes = master_key_bytes.as_slice();
-                query_scalar!(
-                    "INSERT INTO threads(recipient_id, group_master_key) VALUES (NULL, ?1)
+                        uuid,
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?
+                }
+                Thread::Group(master_key_bytes) => {
+                    let master_key_bytes = master_key_bytes.as_slice();
+                    query_scalar!(
+                        "INSERT INTO threads(recipient_id, group_master_key) VALUES (NULL, ?1)
                     ON CONFLICT DO UPDATE SET group_master_key = ?1 RETURNING id",
-                    master_key_bytes
-                )
-                .fetch_one(&mut *tx)
-                .await?
-            }
-        };
+                        master_key_bytes
+                    )
+                    .fetch_one(&mut *tx)
+                    .await?
+                }
+            };
 
-        let Metadata {
-            sender,
-            destination,
-            sender_device,
-            client_timestamp: timestamp,
-            needs_receipt,
-            unidentified_sender,
-            server_guid: _,
-            was_plaintext,
-            server_timestamp: _,
-            pni_verified,
-        } = metadata;
+            let Metadata {
+                sender,
+                destination,
+                sender_device,
+                client_timestamp: timestamp,
+                needs_receipt,
+                unidentified_sender,
+                server_guid: _,
+                was_plaintext,
+                server_timestamp: _,
+                pni_verified,
+            } = metadata;
 
-        let sender_device: u8 = sender_device.into();
-        let sender_service_id = sender.service_id_string();
-        let destination_service_id = destination.service_id_string();
+            let sender_device: u8 = sender_device.into();
+            let sender_service_id = sender.service_id_string();
+            let destination_service_id = destination.service_id_string();
 
-        let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
-        let timestamp = timestamp.timestamp_millis();
+            let proto_bytes = prost::Message::encode_to_vec(&body.into_proto());
+            let timestamp = timestamp.timestamp_millis();
 
-        query!(
-            "INSERT OR REPLACE INTO thread_messages (
+            query!(
+                "INSERT OR REPLACE INTO thread_messages (
                 ts,
                 thread_id,
                 sender_service_id,
@@ -173,19 +181,20 @@ impl ContentsStore for SqliteStore {
                 pni_verified
             )
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            timestamp,
-            thread_id,
-            sender_service_id,
-            sender_device,
-            destination_service_id,
-            needs_receipt,
-            unidentified_sender,
-            proto_bytes,
-            was_plaintext,
-            pni_verified.as_ref().map(|p| p.service_id_string())
-        )
-        .execute(&mut *tx)
-        .await?;
+                timestamp,
+                thread_id,
+                sender_service_id,
+                sender_device,
+                destination_service_id,
+                needs_receipt,
+                unidentified_sender,
+                proto_bytes,
+                was_plaintext,
+                pni_verified.as_ref().map(|p| p.service_id_string())
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -1273,6 +1282,49 @@ mod test {
             !plan.iter().any(|step| step.contains("TEMP B-TREE")),
             "{plan:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[tokio::test]
+    async fn save_messages_equals_saving_one_by_one() -> Result<(), Box<dyn std::error::Error>> {
+        let alice = ServiceId::Aci(Uuid::from_u128(1).into());
+        let bob = ServiceId::Aci(Uuid::from_u128(2).into());
+        let contact = Thread::Contact(alice);
+        let group = Thread::Group([7; 32]);
+        let mut replacement = message(alice, 2);
+        replacement.body = ContentBody::DataMessage(DataMessage {
+            body: Some("replaced".into()),
+            ..Default::default()
+        });
+        let messages = vec![
+            (contact.clone(), message(alice, 1)),
+            (group.clone(), message(bob, 1)),
+            (contact.clone(), message(alice, 2)),
+            (group.clone(), message(alice, 3)),
+            (contact.clone(), replacement),
+        ];
+
+        let one_by_one = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        for (thread, message) in messages.clone() {
+            one_by_one.save_message(&thread, message).await?;
+        }
+        let batched = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        batched.save_messages(messages).await?;
+
+        async fn saved(
+            store: &SqliteStore,
+            thread: &Thread,
+        ) -> Result<Vec<String>, SqliteStoreError> {
+            let messages = store.messages(thread, ..).await?;
+            messages.map(|m| m.map(|m| format!("{m:?}"))).collect()
+        }
+        for thread in [&contact, &group] {
+            let expected = saved(&one_by_one, thread).await?;
+            assert_eq!(expected.len(), 2);
+            assert_eq!(saved(&batched, thread).await?, expected);
+        }
+        assert!(saved(&batched, &contact).await?[0].contains("replaced"));
         Ok(())
     }
 }

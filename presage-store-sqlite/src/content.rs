@@ -352,8 +352,9 @@ impl ContentsStore for SqliteStore {
     ) -> Result<Self::MessagesIter, Self::ContentsStoreError> {
         let (group_master_key, recipient_id) = thread.unzip();
 
-        let (start_incl, start_excl) = range.start_bound().into_sql_bound();
-        let (end_incl, end_excl) = range.end_bound().into_sql_bound();
+        let Some((start, end)) = ts_range(&range) else {
+            return Ok(Box::new(std::iter::empty()));
+        };
 
         let rows = query_as!(
             SqlMessage,
@@ -371,15 +372,12 @@ impl ContentsStore for SqliteStore {
             FROM thread_messages
             WHERE thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
-                AND coalesce(ts > ?, ts >= ?, true)
-                AND coalesce(ts < ?, ts <= ?, true)
+                AND ts >= ? AND ts <= ?
             ORDER BY ts DESC"#,
             group_master_key,
             recipient_id,
-            start_incl,
-            start_excl,
-            end_incl,
-            end_excl
+            start,
+            end,
         )
         .fetch_all(&self.db)
         .await?;
@@ -1017,24 +1015,52 @@ impl ThreadExt for Thread {
     }
 }
 
-trait BoundExt {
-    fn into_sql_bound(self) -> (Option<i64>, Option<i64>);
-}
-
-impl BoundExt for Bound<&u64> {
-    fn into_sql_bound(self) -> (Option<i64>, Option<i64>) {
-        match self {
-            Bound::Excluded(x) => (Some(*x as i64), None),
-            Bound::Included(x) => (None, Some(*x as i64)),
-            Bound::Unbounded => (None, None),
-        }
-    }
+/// Inclusive bounds, so that `ts >= ? AND ts <= ?` can seek the `(thread_id, ts)` index.
+/// `None` if no timestamp is in range.
+fn ts_range(range: &impl RangeBounds<u64>) -> Option<(i64, i64)> {
+    let start = match range.start_bound() {
+        Bound::Included(x) => *x as i64,
+        Bound::Excluded(x) => (*x as i64).checked_add(1)?,
+        Bound::Unbounded => i64::MIN,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(x) => *x as i64,
+        Bound::Excluded(x) => (*x as i64).checked_sub(1)?,
+        Bound::Unbounded => i64::MAX,
+    };
+    Some((start, end))
 }
 
 #[cfg(test)]
 mod test {
+    use presage::{libsignal_service::content::ContentBody, proto::DataMessage};
+    use sqlx::Row;
+
     use super::*;
     use crate::OnNewIdentity;
+
+    fn message(sender: ServiceId, ts: u64) -> Content {
+        let at = chrono::DateTime::from_timestamp_millis(ts as i64).unwrap();
+        Content {
+            metadata: Metadata {
+                sender,
+                destination: sender,
+                sender_device: 1.try_into().unwrap(),
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                server_guid: None,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body: ContentBody::DataMessage(DataMessage {
+                body: Some(format!("{ts}")),
+                timestamp: Some(ts),
+                ..Default::default()
+            }),
+        }
+    }
 
     #[tokio::test]
     async fn upsert_profile_key_reports_the_write() -> Result<(), Box<dyn std::error::Error>> {
@@ -1159,6 +1185,41 @@ mod test {
     }
 
     #[tokio::test]
+    async fn messages_honours_every_bound() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let alice = ServiceId::Aci(Uuid::from_u128(1).into());
+        let bob = ServiceId::Aci(Uuid::from_u128(2).into());
+        let thread = Thread::Contact(alice);
+        for ts in 1..=5 {
+            store.save_message(&thread, message(alice, ts)).await?;
+            store
+                .save_message(&Thread::Contact(bob), message(bob, ts))
+                .await?;
+        }
+
+        let bounds: Vec<Bound<u64>> = [0, 2, 4, i64::MAX as u64]
+            .into_iter()
+            .flat_map(|ts| [Bound::Included(ts), Bound::Excluded(ts)])
+            .chain([Bound::Unbounded])
+            .collect();
+        for &start in &bounds {
+            for &end in &bounds {
+                let expected: Vec<u64> = (1..=5u64)
+                    .rev()
+                    .filter(|ts| (start, end).contains(ts))
+                    .collect();
+                let found = store
+                    .messages(&thread, (start, end))
+                    .await?
+                    .map(|m| Ok(m?.metadata.client_timestamp.timestamp_millis() as u64))
+                    .collect::<Result<Vec<_>, SqliteStoreError>>()?;
+                assert_eq!(found, expected, "{start:?}, {end:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn saving_a_left_group_clears_the_mark() -> Result<(), Box<dyn std::error::Error>> {
         let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
         let master_key = [1u8; 32];
@@ -1182,7 +1243,34 @@ mod test {
         };
         store.save_group(master_key, group).await?;
         assert!(!store.is_group_left(master_key).await?);
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn thread_reads_use_the_thread_index() -> Result<(), Box<dyn std::error::Error>> {
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        // Same filter and order as `messages`.
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT * FROM thread_messages
+            WHERE thread_id = (
+                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
+                AND ts >= ? AND ts <= ?
+            ORDER BY ts DESC",
+        )
+        .fetch_all(&store.db)
+        .await?
+        .iter()
+        .map(|row| row.get("detail"))
+        .collect();
+        assert!(
+            plan.iter().any(|step| step
+                .contains("USING INDEX thread_messages_thread_ts (thread_id=? AND ts>? AND ts<?)")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
         Ok(())
     }
 }

@@ -8,6 +8,7 @@ use futures::{future, AsyncReadExt, Stream, StreamExt};
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::provisioning::ProvisioningSecrets;
+use libsignal_service::session_lock::SessionLock;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
@@ -87,6 +88,8 @@ pub struct Registered {
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
     pub(crate) link_preview_client: OnceLock<reqwest::Client>,
+    /// Shared by every cipher and sender of this account, and by its clones.
+    pub(crate) session_lock: SessionLock,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -106,6 +109,7 @@ impl Registered {
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
             link_preview_client: Default::default(),
+            session_lock: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -2142,6 +2146,7 @@ impl<S: Store> Manager<S, Registered> {
     /// Clears all sessions established with [recipient](ServiceId).
     pub async fn clear_sessions(&self, recipient: &ServiceId) -> Result<(), Error<S::Error>> {
         use libsignal_service::session_store::SessionStoreExt;
+        let _step = self.state.session_lock.step().await;
         self.store
             .aci_protocol_store()
             .delete_all_sessions(recipient)
@@ -2295,6 +2300,7 @@ impl<S: Store> Manager<S, Registered> {
         trace!(recipient = %recipient.service_id_string(), "resetting session for address");
 
         let mut store = self.store.aci_protocol_store();
+        let step = self.state.session_lock.step().await;
 
         // Archive all sessions with all receiver devices.
         // Note that the "get_sub_device_sessions" does not include the main device, therefore add it.
@@ -2316,6 +2322,7 @@ impl<S: Store> Manager<S, Registered> {
                 store.store_session(&address, &session).await?;
             }
         }
+        drop(step);
 
         // TODO: Signal Android also deletes entries in some sender_key_shared table; we don't have such a table yet.
         // Does not seem necessary though.
@@ -2426,6 +2433,7 @@ impl<S: Store> Manager<S, Registered> {
                 self.state.device_id(),
             ),
         )
+        .with_session_lock(self.state.session_lock.clone())
     }
 
     fn new_service_cipher_pni(&self) -> ServiceCipher<S::PniStore> {
@@ -2439,6 +2447,7 @@ impl<S: Store> Manager<S, Registered> {
                 self.state.device_id(),
             ),
         )
+        .with_session_lock(self.state.session_lock.clone())
     }
 
     /// Returns the title of a thread (contact or group).

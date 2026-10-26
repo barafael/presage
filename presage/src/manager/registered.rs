@@ -2996,10 +2996,17 @@ async fn save_message<S: Store>(
 
     if let Some(message) = message {
         // Messages are stored by thread and time, so a sender's message must not take the
-        // place of someone else's.
+        // place of someone else's. A receipt gives way: one that went out or came in at the
+        // millisecond of a message must not keep that message out, nor take its place.
         let ts = message.metadata.client_timestamp.timestamp_millis() as u64;
+        let receipt = |content: &Content| matches!(content.body, ContentBody::ReceiptMessage(_));
         match store.message(&thread, ts).await? {
-            Some(existing) if existing.metadata.sender != message.metadata.sender => {
+            Some(existing) if receipt(&message) && !receipt(&existing) => {
+                debug!(%thread, ts, "not saving a receipt in the place of a message");
+            }
+            Some(existing)
+                if existing.metadata.sender != message.metadata.sender && !receipt(&existing) =>
+            {
                 warn!(%thread, ts, "not saving a message in the place of someone else's");
             }
             _ => store.save_message(&thread, message).await?,

@@ -709,7 +709,10 @@ impl<S: Store> Manager<S, Registered> {
             async move {
                 loop {
                     match state.encrypted_messages.next().await {
-                        Some(Ok(Incoming::Envelope(envelope))) => {
+                        Some(Ok(Incoming::Envelope { envelope, ack })) => {
+                            // Acknowledges the envelope when the arm ends, once the message is
+                            // stored: one acknowledged before that is lost if the process dies.
+                            let _ack = ack;
                             // Who sent an unsealed envelope, as the server authenticated it:
                             // names the sender of a message that fails to decrypt.
                             let source = envelope.parse_source_service_id();

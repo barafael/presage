@@ -707,371 +707,373 @@ impl<S: Store> Manager<S, Registered> {
                 loop {
                     match state.encrypted_messages.next().await {
                         Some(Ok(Incoming::Envelope { envelope, ack })) => {
-                            // Acknowledges the envelope when the arm ends, once the message is
-                            // stored: one acknowledged before that is lost if the process dies.
-                            let _ack = ack;
-                            // Who sent an unsealed envelope, as the server authenticated it:
-                            // names the sender of a message that fails to decrypt.
-                            let source = envelope.parse_source_service_id();
-                            // What a retry receipt names the message by.
-                            let timestamp = envelope.client_timestamp();
-                            let source_device = envelope.source_device_id();
-                            let envelope = {
-                                // the permit is released at the end of the block (impl Drop)
-                                match envelope.parse_destination_service_id() {
-                                    None => {
-                                        warn!("Message has no destination service ID, dropping.");
-                                        continue;
-                                    }
-                                    Some(ServiceId::Aci(_)) => {
-                                        state
-                                            .service_cipher_aci
-                                            .open_envelope(envelope, &mut rand::rng())
-                                            .await
-                                    }
-                                    Some(ServiceId::Pni(pni)) => {
-                                        if pni == state.service_ids.pni()
-                                            && envelope.parse_source_service_id().is_none()
-                                        {
-                                            warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
-                                            continue;
+                            let received = async {
+                                // Who sent an unsealed envelope, as the server authenticated it:
+                                // names the sender of a message that fails to decrypt.
+                                let source = envelope.parse_source_service_id();
+                                // What a retry receipt names the message by.
+                                let timestamp = envelope.client_timestamp();
+                                let source_device = envelope.source_device_id();
+                                let envelope = {
+                                    // the permit is released at the end of the block (impl Drop)
+                                    match envelope.parse_destination_service_id() {
+                                        None => {
+                                            warn!("Message has no destination service ID, dropping.");
+                                            return None;
                                         }
-                                        state
-                                            .service_cipher_pni
-                                            .open_envelope(envelope, &mut rng())
-                                            .await
+                                        Some(ServiceId::Aci(_)) => {
+                                            state
+                                                .service_cipher_aci
+                                                .open_envelope(envelope, &mut rand::rng())
+                                                .await
+                                        }
+                                        Some(ServiceId::Pni(pni)) => {
+                                            if pni == state.service_ids.pni()
+                                                && envelope.parse_source_service_id().is_none()
+                                            {
+                                                warn!("Got a sealed sender message to our PNI? Invalid message, ignoring.");
+                                                return None;
+                                            }
+                                            state
+                                                .service_cipher_pni
+                                                .open_envelope(envelope, &mut rng())
+                                                .await
+                                        }
                                     }
-                                }
-                            };
-                            match envelope {
-                                Ok(Some(content)) => {
-                                    if let ContentBody::DecryptionErrorMessage(message) =
-                                        content.body
-                                    {
-                                        warn!(
-                                            sender = %content.metadata.sender.service_id_string(),
-                                            device = %content.metadata.sender_device,
-                                            timestamp = message.timestamp,
-                                            "a device of theirs failed to decrypt a message of ours"
-                                        );
-                                        return Some((
-                                            Received::RetryReceipt {
+                                };
+                                match envelope {
+                                    Ok(Some(content)) => {
+                                        if let ContentBody::DecryptionErrorMessage(message) =
+                                            content.body
+                                        {
+                                            warn!(
+                                                sender = %content.metadata.sender.service_id_string(),
+                                                device = %content.metadata.sender_device,
+                                                timestamp = message.timestamp,
+                                                "a device of theirs failed to decrypt a message of ours"
+                                            );
+                                            return Some(Received::RetryReceipt {
                                                 sender: content.metadata.sender,
                                                 sender_device: content.metadata.sender_device,
                                                 message,
-                                            },
-                                            state,
-                                        ));
-                                    }
+                                            });
+                                        }
 
-                                    if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        content: Some(SyncContent::Request(request)),
-                                        ..
-                                    }) = &content.body
-                                    {
-                                        use libsignal_service::content::sync_message::request::Type as RequestType;
+                                        if let ContentBody::SynchronizeMessage(SyncMessage {
+                                            content: Some(SyncContent::Request(request)),
+                                            ..
+                                        }) = &content.body
+                                        {
+                                            use libsignal_service::content::sync_message::request::Type as RequestType;
 
-                                        match request.r#type() {
-                                            RequestType::Contacts => {
-                                                let contacts = state
-                                                    .store
-                                                    .contacts()
-                                                    .await
-                                                    .map(|i| {
-                                                        i.collect::<Result<Vec<_>, _>>()
-                                                            .unwrap_or_default()
-                                                    })
-                                                    .unwrap_or_default();
+                                            match request.r#type() {
+                                                RequestType::Contacts => {
+                                                    let contacts = state
+                                                        .store
+                                                        .contacts()
+                                                        .await
+                                                        .map(|i| {
+                                                            i.collect::<Result<Vec<_>, _>>()
+                                                                .unwrap_or_default()
+                                                        })
+                                                        .unwrap_or_default();
 
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                let aci = state.service_ids.aci();
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender
-                                                    .send_contact_details(
-                                                        &ServiceId::Aci(aci),
-                                                        None,
-                                                        contacts.into_iter().map(|c| libsignal_service::sender::ContactDetails {
-                                                            number: c.phone_number.map(|p| p.to_string()),
-                                                            aci: Some(c.uuid.to_string()),
-                                                            aci_binary: Some(c.uuid.into_bytes().into()),
-                                                            name: Some(c.name),
-                                                            avatar: c.avatar.map(|a| libsignal_service::proto::contact_details::Avatar {
-                                                                content_type: Some(a.content_type),
-                                                                length: a.reader.len().try_into().ok(),
+                                                    let mut message_sender =
+                                                        state.message_sender.clone();
+                                                    let aci = state.service_ids.aci();
+                                                    tokio::task::spawn_local(async move {
+                                                        let result = message_sender
+                                                        .send_contact_details(
+                                                            &ServiceId::Aci(aci),
+                                                            None,
+                                                            contacts.into_iter().map(|c| libsignal_service::sender::ContactDetails {
+                                                                number: c.phone_number.map(|p| p.to_string()),
+                                                                aci: Some(c.uuid.to_string()),
+                                                                aci_binary: Some(c.uuid.into_bytes().into()),
+                                                                name: Some(c.name),
+                                                                avatar: c.avatar.map(|a| libsignal_service::proto::contact_details::Avatar {
+                                                                    content_type: Some(a.content_type),
+                                                                    length: a.reader.len().try_into().ok(),
+                                                                }),
+                                                                expire_timer: Some(c.expire_timer),
+                                                                expire_timer_version: Some(c.expire_timer_version),
+                                                                inbox_position: None,
                                                             }),
-                                                            expire_timer: Some(c.expire_timer),
-                                                            expire_timer_version: Some(c.expire_timer_version),
-                                                            inbox_position: None,
-                                                        }),
-                                                        false,
-                                                        true,
-                                                    )
-                                                    .await;
+                                                            false,
+                                                            true,
+                                                        )
+                                                        .await;
 
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending contact details to other devices");
-                                                    }
-                                                });
-                                            }
-                                            RequestType::Keys => {
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                let account_entropy_pool = state
-                                                    .account_entropy_pool
-                                                    .as_ref()
-                                                    .map(|aep| aep.to_string());
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender.send_sync_message(SyncMessage {
-                                                        content: Some(SyncContent::Keys(libsignal_service::content::sync_message::Keys {
-                                                            account_entropy_pool,
-                                                            media_root_backup_key: None,
+                                                        if let Err(error) = result {
+                                                            warn!(%error, "Error sending contact details to other devices");
+                                                        }
+                                                    });
+                                                }
+                                                RequestType::Keys => {
+                                                    let mut message_sender =
+                                                        state.message_sender.clone();
+                                                    let account_entropy_pool = state
+                                                        .account_entropy_pool
+                                                        .as_ref()
+                                                        .map(|aep| aep.to_string());
+                                                    tokio::task::spawn_local(async move {
+                                                        let result = message_sender.send_sync_message(SyncMessage {
+                                                            content: Some(SyncContent::Keys(libsignal_service::content::sync_message::Keys {
+                                                                account_entropy_pool,
+                                                                media_root_backup_key: None,
+                                                            })),
+                                                            ..SyncMessage::with_padding(&mut rand::rng())
+                                                        }).await;
+
+                                                        if let Err(error) = result {
+                                                            warn!(%error, "Error sending keys to other devices");
+                                                        }
+                                                    });
+                                                }
+                                                RequestType::Blocked => {
+                                                    warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
+                                                    let mut message_sender =
+                                                        state.message_sender.clone();
+                                                    tokio::task::spawn_local(async move {
+                                                        let result = message_sender.send_sync_message(SyncMessage {
+                                                        content: Some(SyncContent::Blocked(libsignal_service::content::sync_message::Blocked {
+                                                            numbers: vec![],
+                                                            acis: vec![],
+                                                            acis_binary: vec![],
+                                                            group_ids: vec![],
                                                         })),
                                                         ..SyncMessage::with_padding(&mut rand::rng())
                                                     }).await;
 
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending keys to other devices");
-                                                    }
-                                                });
-                                            }
-                                            RequestType::Blocked => {
-                                                warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
-                                                let mut message_sender =
-                                                    state.message_sender.clone();
-                                                tokio::task::spawn_local(async move {
-                                                    let result = message_sender.send_sync_message(SyncMessage {
-                                                    content: Some(SyncContent::Blocked(libsignal_service::content::sync_message::Blocked {
-                                                        numbers: vec![],
-                                                        acis: vec![],
-                                                        acis_binary: vec![],
-                                                        group_ids: vec![],
-                                                    })),
-                                                    ..SyncMessage::with_padding(&mut rand::rng())
-                                                }).await;
-
-                                                    if let Err(error) = result {
-                                                        warn!(%error, "Error sending blocked contacts to other devices");
-                                                    }
-                                                });
-                                            }
-                                            t => {
-                                                info!(type = ?t, "Got sync request of currently unhandled type")
-                                            }
-                                        }
-                                    }
-
-                                    // contacts synchronization sent from the primary device (happens after linking, or on demand)
-                                    if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        content: Some(SyncContent::Contacts(contacts)),
-                                        ..
-                                    }) = &content.body
-                                    {
-                                        match state
-                                            .message_receiver
-                                            .retrieve_contacts(contacts)
-                                            .await
-                                        {
-                                            Ok(contacts) => {
-                                                info!("saving contacts");
-                                                for contact in contacts.filter_map(Result::ok) {
-                                                    if let Err(error) = state
-                                                        .store
-                                                        .save_contact(&contact.into())
-                                                        .await
-                                                    {
-                                                        warn!(%error, "failed to save contacts");
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                warn!(%error, "failed to retrieve contacts");
-                                            }
-                                        }
-
-                                        return Some((Received::Contacts, state));
-                                    }
-
-                                    // sticker pack operations
-                                    if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        sticker_pack_operation,
-                                        ..
-                                    }) = &content.body
-                                    {
-                                        for operation in sticker_pack_operation {
-                                            match operation.r#type() {
-                                                sticker_pack_operation::Type::Install => {
-                                                    let store = state.store.clone();
-                                                    let unidentified_websocket =
-                                                        state.unidentified_websocket.clone();
-                                                    let operation = operation.clone();
-
-                                                    // download stickers in the background
-                                                    tokio::spawn(async move {
-                                                        match download_sticker_pack(
-                                                            store,
-                                                            unidentified_websocket,
-                                                            &operation,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(sticker_pack) => {
-                                                                debug!(
-                                                                "downloaded sticker pack: {} made by {}",
-                                                                sticker_pack.manifest.title,
-                                                                sticker_pack.manifest.author
-                                                            );
-                                                            }
-                                                            Err(error) => error!(
-                                                                %error,
-                                                                "failed to download sticker pack"
-                                                            ),
+                                                        if let Err(error) = result {
+                                                            warn!(%error, "Error sending blocked contacts to other devices");
                                                         }
                                                     });
                                                 }
-                                                sticker_pack_operation::Type::Remove => match state
-                                                    .store
-                                                    .remove_sticker_pack(operation.pack_id())
-                                                    .await
-                                                {
-                                                    Ok(was_present) => {
-                                                        debug!(was_present, "removed stick pack")
-                                                    }
-                                                    Err(error) => {
-                                                        error!(
-                                                            %error,
-                                                            "failed to remove sticker pack"
-                                                        )
-                                                    }
-                                                },
+                                                t => {
+                                                    info!(type = ?t, "Got sync request of currently unhandled type")
+                                                }
                                             }
                                         }
-                                    }
 
-                                    // key synchronization sent from the primary device
-                                    if let ContentBody::SynchronizeMessage(SyncMessage {
-                                        content: Some(SyncContent::Keys(keys)),
-                                        ..
-                                    }) = &content.body
-                                    {
-                                        debug!("received key sync message");
-                                        if state.registration_type == RegistrationType::Primary {
-                                            warn!("received a key sync message as a primary device; ignoring")
-                                        } else {
-                                            match keys
-                                                .account_entropy_pool
-                                                .as_ref()
-                                                .map(|s| AccountEntropyPool::from_str(s))
+                                        // contacts synchronization sent from the primary device (happens after linking, or on demand)
+                                        if let ContentBody::SynchronizeMessage(SyncMessage {
+                                            content: Some(SyncContent::Contacts(contacts)),
+                                            ..
+                                        }) = &content.body
+                                        {
+                                            match state
+                                                .message_receiver
+                                                .retrieve_contacts(contacts)
+                                                .await
                                             {
-                                                Some(Ok(aep)) => {
-                                                    if let Err(error) = state
+                                                Ok(contacts) => {
+                                                    info!("saving contacts");
+                                                    for contact in contacts.filter_map(Result::ok) {
+                                                        if let Err(error) = state
+                                                            .store
+                                                            .save_contact(&contact.into())
+                                                            .await
+                                                        {
+                                                            warn!(%error, "failed to save contacts");
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    warn!(%error, "failed to retrieve contacts");
+                                                }
+                                            }
+
+                                            return Some(Received::Contacts);
+                                        }
+
+                                        // sticker pack operations
+                                        if let ContentBody::SynchronizeMessage(SyncMessage {
+                                            sticker_pack_operation,
+                                            ..
+                                        }) = &content.body
+                                        {
+                                            for operation in sticker_pack_operation {
+                                                match operation.r#type() {
+                                                    sticker_pack_operation::Type::Install => {
+                                                        let store = state.store.clone();
+                                                        let unidentified_websocket =
+                                                            state.unidentified_websocket.clone();
+                                                        let operation = operation.clone();
+
+                                                        // download stickers in the background
+                                                        tokio::spawn(async move {
+                                                            match download_sticker_pack(
+                                                                store,
+                                                                unidentified_websocket,
+                                                                &operation,
+                                                            )
+                                                            .await
+                                                            {
+                                                                Ok(sticker_pack) => {
+                                                                    debug!(
+                                                                    "downloaded sticker pack: {} made by {}",
+                                                                    sticker_pack.manifest.title,
+                                                                    sticker_pack.manifest.author
+                                                                );
+                                                                }
+                                                                Err(error) => error!(
+                                                                    %error,
+                                                                    "failed to download sticker pack"
+                                                                ),
+                                                            }
+                                                        });
+                                                    }
+                                                    sticker_pack_operation::Type::Remove => match state
                                                         .store
-                                                        .store_account_entropy_pool(Some(&aep))
+                                                        .remove_sticker_pack(operation.pack_id())
                                                         .await
                                                     {
-                                                        error!(%error, "failed to store account entropy pool");
-                                                    }
-                                                    state.account_entropy_pool = Some(aep);
+                                                        Ok(was_present) => {
+                                                            debug!(was_present, "removed stick pack")
+                                                        }
+                                                        Err(error) => {
+                                                            error!(
+                                                                %error,
+                                                                "failed to remove sticker pack"
+                                                            )
+                                                        }
+                                                    },
                                                 }
-                                                Some(Err(error)) => {
-                                                    warn!(%error, "cannot convert account entropy pool from string")
-                                                }
-                                                None => {}
                                             }
                                         }
-                                    }
 
-                                    // group update
-                                    if let ContentBody::DataMessage(DataMessage {
-                                        group_v2:
-                                            Some(GroupContextV2 {
-                                                master_key: Some(master_key_bytes),
-                                                revision: Some(revision),
-                                                ..
-                                            }),
-                                        ..
-                                    })
-                                    | ContentBody::SynchronizeMessage(SyncMessage {
-                                        content:
-                                            Some(SyncContent::Sent(sync_message::Sent {
-                                                message:
-                                                    Some(DataMessage {
-                                                        group_v2:
-                                                            Some(GroupContextV2 {
-                                                                master_key: Some(master_key_bytes),
-                                                                revision: Some(revision),
-                                                                ..
-                                                            }),
-                                                        ..
-                                                    }),
-                                                ..
-                                            })),
-                                        ..
-                                    }) = &content.body
-                                    {
-                                        // there's two things to implement: the group metadata (fetched from HTTP API)
-                                        // and the group changes, which are part of the protobuf messages
-                                        // this means we kinda need our own internal representation of groups inside of presage?
-                                        if let Ok(Some(group)) = upsert_group(
-                                            &state.store,
-                                            &mut state.groups_manager,
-                                            master_key_bytes,
-                                            revision,
+                                        // key synchronization sent from the primary device
+                                        if let ContentBody::SynchronizeMessage(SyncMessage {
+                                            content: Some(SyncContent::Keys(keys)),
+                                            ..
+                                        }) = &content.body
+                                        {
+                                            debug!("received key sync message");
+                                            if state.registration_type == RegistrationType::Primary {
+                                                warn!("received a key sync message as a primary device; ignoring")
+                                            } else {
+                                                match keys
+                                                    .account_entropy_pool
+                                                    .as_ref()
+                                                    .map(|s| AccountEntropyPool::from_str(s))
+                                                {
+                                                    Some(Ok(aep)) => {
+                                                        if let Err(error) = state
+                                                            .store
+                                                            .store_account_entropy_pool(Some(&aep))
+                                                            .await
+                                                        {
+                                                            error!(%error, "failed to store account entropy pool");
+                                                        }
+                                                        state.account_entropy_pool = Some(aep);
+                                                    }
+                                                    Some(Err(error)) => {
+                                                        warn!(%error, "cannot convert account entropy pool from string")
+                                                    }
+                                                    None => {}
+                                                }
+                                            }
+                                        }
+
+                                        // group update
+                                        if let ContentBody::DataMessage(DataMessage {
+                                            group_v2:
+                                                Some(GroupContextV2 {
+                                                    master_key: Some(master_key_bytes),
+                                                    revision: Some(revision),
+                                                    ..
+                                                }),
+                                            ..
+                                        })
+                                        | ContentBody::SynchronizeMessage(SyncMessage {
+                                            content:
+                                                Some(SyncContent::Sent(sync_message::Sent {
+                                                    message:
+                                                        Some(DataMessage {
+                                                            group_v2:
+                                                                Some(GroupContextV2 {
+                                                                    master_key: Some(master_key_bytes),
+                                                                    revision: Some(revision),
+                                                                    ..
+                                                                }),
+                                                            ..
+                                                        }),
+                                                    ..
+                                                })),
+                                            ..
+                                        }) = &content.body
+                                        {
+                                            // there's two things to implement: the group metadata (fetched from HTTP API)
+                                            // and the group changes, which are part of the protobuf messages
+                                            // this means we kinda need our own internal representation of groups inside of presage?
+                                            if let Ok(Some(group)) = upsert_group(
+                                                &state.store,
+                                                &mut state.groups_manager,
+                                                master_key_bytes,
+                                                revision,
+                                            )
+                                            .await
+                                            {
+                                                trace!(?group, "upserted group");
+                                            }
+                                        }
+
+                                        if let Err(error) = save_message(
+                                            &mut state.store,
+                                            &mut state.identified_websocket,
+                                            content.clone(),
+                                            None,
                                         )
                                         .await
                                         {
-                                            trace!(?group, "upserted group");
+                                            error!(%error, "error saving message to store");
                                         }
-                                    }
 
-                                    if let Err(error) = save_message(
-                                        &mut state.store,
-                                        &mut state.identified_websocket,
-                                        content.clone(),
-                                        None,
-                                    )
-                                    .await
-                                    {
-                                        error!(%error, "error saving message to store");
+                                        return Some(Received::Content(Box::new(content)));
                                     }
-
-                                    return Some((Received::Content(Box::new(content)), state));
-                                }
-                                Ok(None) => {
-                                    debug!("empty envelope, message will be skipped!")
-                                }
-                                Err(error) => {
-                                    error!(%error, "error opening envelope, message will be skipped!");
-                                    use libsignal_service::cipher::SealedSenderDecryptionError;
-                                    use libsignal_service::prelude::ServiceError;
-                                    // A sealed sender is known once the certificate checked out;
-                                    // an unsealed one is in the envelope.
-                                    let failed = match error {
-                                        ServiceError::SealedSenderDecryptionError(
-                                            SealedSenderDecryptionError {
-                                                sender: Some(sender),
-                                                inner,
-                                            },
-                                        ) => ServiceId::parse_from_service_id_string(sender.name())
-                                            .map(|id| (id, sender.device_id(), inner)),
-                                        ServiceError::SignalProtocolError(error) => source
-                                            .zip(DeviceId::try_from(source_device).ok())
-                                            .map(|(sender, device)| (sender, device, error)),
-                                        _ => None,
-                                    };
-                                    if let Some((sender, sender_device, error)) = failed {
-                                        return Some((
-                                            Received::DecryptionError {
+                                    Ok(None) => {
+                                        debug!("empty envelope, message will be skipped!")
+                                    }
+                                    Err(error) => {
+                                        error!(%error, "error opening envelope, message will be skipped!");
+                                        use libsignal_service::cipher::SealedSenderDecryptionError;
+                                        use libsignal_service::prelude::ServiceError;
+                                        // A sealed sender is known once the certificate checked out;
+                                        // an unsealed one is in the envelope.
+                                        let failed = match error {
+                                            ServiceError::SealedSenderDecryptionError(
+                                                SealedSenderDecryptionError {
+                                                    sender: Some(sender),
+                                                    inner,
+                                                },
+                                            ) => ServiceId::parse_from_service_id_string(sender.name())
+                                                .map(|id| (id, sender.device_id(), inner)),
+                                            ServiceError::SignalProtocolError(error) => source
+                                                .zip(DeviceId::try_from(source_device).ok())
+                                                .map(|(sender, device)| (sender, device, error)),
+                                            _ => None,
+                                        };
+                                        if let Some((sender, sender_device, error)) = failed {
+                                            return Some(Received::DecryptionError {
                                                 sender,
                                                 sender_device,
                                                 timestamp,
                                                 error,
-                                            },
-                                            state,
-                                        ));
+                                            });
+                                        }
                                     }
                                 }
+                                None
+                            }
+                            .await;
+                            // Acknowledged once handled, its message stored. A task dropped while
+                            // handling it (a process ending, say) leaves it unacknowledged, for the
+                            // server to deliver again.
+                            ack.ack();
+                            if let Some(received) = received {
+                                return Some((received, state));
                             }
                         }
                         Some(Ok(Incoming::QueueEmpty)) => {

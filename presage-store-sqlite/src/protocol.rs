@@ -951,6 +951,81 @@ mod test {
             .count()
     }
 
+    /// A session stored and a decrypted message kept in one transaction: both once it is
+    /// committed, neither when it is dropped, as when the receiver stops in between.
+    #[tokio::test]
+    async fn a_transaction_writes_all_or_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::TimeZone;
+        use presage::{
+            libsignal_service::content::{Content, ContentBody, Metadata},
+            proto::DataMessage,
+            store::{ContentsStore, Store},
+        };
+        let store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let sender = ServiceId::Aci(Uuid::from_u128(9).into());
+        let remote = ProtocolAddress::new(sender.service_id_string(), DeviceId::new(1).unwrap());
+        let their = IdentityKeyPair::generate(&mut rand::rng());
+        let at = chrono::Utc.timestamp_millis_opt(1000).unwrap();
+        let content = Content {
+            metadata: Metadata {
+                sender,
+                destination: sender,
+                sender_device: 1.try_into()?,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: true,
+                unidentified_sender: true,
+                server_guid: None,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body: ContentBody::DataMessage(DataMessage {
+                body: Some("kept".into()),
+                timestamp: Some(1000),
+                ..Default::default()
+            }),
+        };
+
+        {
+            let mut transaction = store.transaction().await?;
+            store_session_with(&mut transaction.aci_protocol_store(), &remote, &their).await?;
+            transaction.keep_decrypted(&content).await?;
+        }
+        assert!(
+            store
+                .aci_protocol_store()
+                .load_session(&remote)
+                .await?
+                .is_none()
+        );
+        assert!(store.decrypted().await?.is_empty());
+
+        let mut transaction = store.transaction().await?;
+        store_session_with(&mut transaction.aci_protocol_store(), &remote, &their).await?;
+        let id = transaction.keep_decrypted(&content).await?;
+        transaction.commit().await?;
+        assert!(
+            store
+                .aci_protocol_store()
+                .load_session(&remote)
+                .await?
+                .is_some()
+        );
+        let decrypted = store.decrypted().await?;
+        assert_eq!(decrypted.len(), 1);
+        assert_eq!(decrypted[0].0, id);
+        let ContentBody::DataMessage(DataMessage { body, .. }) = &decrypted[0].1.body else {
+            panic!("not the message kept");
+        };
+        assert_eq!(body.as_deref(), Some("kept"));
+        assert_eq!(decrypted[0].1.metadata.sender, sender);
+        assert!(decrypted[0].1.metadata.needs_receipt);
+
+        store.clone().handled(id).await?;
+        assert!(store.decrypted().await?.is_empty());
+        Ok(())
+    }
+
     /// The notice never takes the place of a message stored at the same millisecond.
     #[tokio::test]
     async fn the_notice_does_not_replace_a_message() -> Result<(), Box<dyn std::error::Error>> {

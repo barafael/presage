@@ -2815,10 +2815,16 @@ async fn upsert_group<S: Store>(
     if upsert_group {
         debug!("fetching and saving group");
         let mut fetched = fetch_group(store, groups_manager, master_key, avatar_path.clone()).await;
-        // Once more: nothing fetches the group again until its next message, and until then it
-        // stays as it was (a member who left, still listed).
-        if let Err(error) = &fetched {
-            warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
+        // Once more if the connection failed: nothing fetches the group again until its next
+        // message, and until then it stays as it was (a member who left, still listed). Not if
+        // the server answered: a refusal (we aren't a member) would be the same again.
+        if fetched
+            .as_ref()
+            .is_err_and(|error| matches!(error, Error::ServiceError(error) if transient(error)))
+        {
+            if let Err(error) = &fetched {
+                warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
+            }
             fetched = fetch_group(store, groups_manager, master_key, avatar_path).await;
         }
         if let Err(error) = fetched {
@@ -2827,6 +2833,14 @@ async fn upsert_group<S: Store>(
     }
 
     Ok(store.group(master_key_bytes.try_into()?).await?)
+}
+
+/// Whether `error` is the connection's, not the server's answer: worth sending again.
+fn transient(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::Http(_) | ServiceError::Timeout { .. } | ServiceError::IO(_)
+    )
 }
 
 /// An error with its causes, each after a colon: reqwest's own message leaves them out ("error
@@ -3624,6 +3638,15 @@ mod tests {
 #[cfg(test)]
 mod causes_tests {
     use super::Causes;
+
+    /// A broken connection is worth fetching again; a refusal isn't.
+    #[test]
+    fn only_a_failed_connection_is_fetched_again() {
+        use super::{transient, ServiceError};
+        assert!(transient(&ServiceError::Timeout { attempts: 1 }));
+        assert!(transient(&ServiceError::IO(std::io::Error::other("reset"))));
+        assert!(!transient(&ServiceError::Unauthorized));
+    }
 
     /// The causes follow the error, as reqwest's own message leaves them out.
     #[test]

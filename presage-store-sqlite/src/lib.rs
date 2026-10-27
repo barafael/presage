@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use db::{Db, Write};
 use futures::lock::Mutex;
@@ -119,9 +119,12 @@ impl SqliteStore {
         options: SqliteConnectOptions,
         trust_new_identities: OnNewIdentity,
     ) -> Result<Self, SqliteStoreError> {
+        // Every commit syncs to disk; on slow or busy storage (an SD card, a loaded laptop) one
+        // can take seconds, and sqlx's default busy timeout of 5 s then fails the writers waiting.
         let options = options
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full);
+            .synchronous(SqliteSynchronous::Full)
+            .busy_timeout(Duration::from_secs(30));
         // Each connection carries its own page cache; sqlx's default of 10 is more than we need.
         let db = SqlitePoolOptions::new()
             .max_connections(3)

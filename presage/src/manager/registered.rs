@@ -2814,12 +2814,35 @@ async fn upsert_group<S: Store>(
 
     if upsert_group {
         debug!("fetching and saving group");
-        if let Err(error) = fetch_group(store, groups_manager, master_key, avatar_path).await {
-            warn!(%error, "failed to fetch encrypted group");
+        let mut fetched = fetch_group(store, groups_manager, master_key, avatar_path.clone()).await;
+        // Once more: nothing fetches the group again until its next message, and until then it
+        // stays as it was (a member who left, still listed).
+        if let Err(error) = &fetched {
+            warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
+            fetched = fetch_group(store, groups_manager, master_key, avatar_path).await;
+        }
+        if let Err(error) = fetched {
+            warn!(error = %Causes(&error), "failed to fetch encrypted group");
         }
     }
 
     Ok(store.group(master_key_bytes.try_into()?).await?)
+}
+
+/// An error with its causes, each after a colon: reqwest's own message leaves them out ("error
+/// sending request for url" doesn't say that the connection closed under the request).
+struct Causes<'a>(&'a dyn std::error::Error);
+
+impl fmt::Display for Causes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
+        Ok(())
+    }
 }
 
 /// Download and decrypt a sticker manifest
@@ -3595,5 +3618,27 @@ mod tests {
         let message = message("https://example.org");
         assert_eq!(manager.state.automatic_link_preview_body(&message), None);
         assert_eq!(clone.state.automatic_link_preview_body(&message), None);
+    }
+}
+
+#[cfg(test)]
+mod causes_tests {
+    use super::Causes;
+
+    /// The causes follow the error, as reqwest's own message leaves them out.
+    #[test]
+    fn an_error_is_logged_with_its_causes() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("error sending request for url")]
+        struct Sending(#[source] std::io::Error);
+
+        let error = Sending(std::io::Error::other(
+            "connection closed before message completed",
+        ));
+        assert_eq!(
+            Causes(&error).to_string(),
+            "error sending request for url: connection closed before message completed"
+        );
+        assert_eq!(Causes(&std::io::Error::other("alone")).to_string(), "alone");
     }
 }

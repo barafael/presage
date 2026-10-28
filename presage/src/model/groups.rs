@@ -48,6 +48,11 @@ impl Group {
             password: self.invite_link_password.clone(),
         })
     }
+
+    /// Whether `aci` is a full member (not only invited or requesting to join).
+    pub fn is_member(&self, aci: &Aci) -> bool {
+        self.members.iter().any(|member| member.aci == *aci)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

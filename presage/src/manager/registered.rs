@@ -706,6 +706,10 @@ impl<S: Store> Manager<S, Registered> {
             message_sender: MessageSender<AciStore>,
             account_entropy_pool: Option<AccountEntropyPool>,
             registration_type: RegistrationType,
+            /// The ids of sticker packs installed elsewhere, once downloaded and stored in the
+            /// background: what the stream says with [`Received::StickerPackInstalled`].
+            stored_packs: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>,
+            stored_packs_sender: futures::channel::mpsc::UnboundedSender<Vec<u8>>,
         }
 
         /// Handles a decrypted content: stores it, and what else it asks for.
@@ -866,6 +870,7 @@ impl<S: Store> Manager<S, Registered> {
                             let store = state.store.clone();
                             let unidentified_websocket = state.unidentified_websocket.clone();
                             let operation = operation.clone();
+                            let stored = state.stored_packs_sender.clone();
 
                             // download stickers in the background
                             tokio::spawn(async move {
@@ -882,6 +887,8 @@ impl<S: Store> Manager<S, Registered> {
                                             sticker_pack.manifest.title,
                                             sticker_pack.manifest.author
                                         );
+                                        // Gone only with the stream.
+                                        let _ = stored.unbounded_send(operation.pack_id().to_vec());
                                     }
                                     Err(error) => error!(
                                         %error,
@@ -1050,6 +1057,7 @@ impl<S: Store> Manager<S, Registered> {
         };
 
         let encrypted_messages = MessagePipe::from_socket(identified_websocket.clone());
+        let (stored_packs_sender, stored_packs) = futures::channel::mpsc::unbounded();
 
         let init = StreamState {
             store: self.store.clone(),
@@ -1085,6 +1093,8 @@ impl<S: Store> Manager<S, Registered> {
             message_sender: self.new_message_sender().await?,
             account_entropy_pool: self.account_entropy_pool().await?,
             registration_type: self.registration_type(),
+            stored_packs,
+            stored_packs_sender,
         };
 
         debug!("starting to consume incoming message stream");
@@ -1106,7 +1116,26 @@ impl<S: Store> Manager<S, Registered> {
                         }
                         continue;
                     }
-                    match state.encrypted_messages.next().await {
+                    // A sticker pack stored in the background, or the next message.
+                    let next = match future::select(
+                        state.stored_packs.next(),
+                        state.encrypted_messages.next(),
+                    )
+                    .await
+                    {
+                        future::Either::Left((Some(pack_id), _)) => future::Either::Left(pack_id),
+                        future::Either::Left((None, incoming)) => {
+                            future::Either::Right(incoming.await)
+                        }
+                        future::Either::Right((incoming, _)) => future::Either::Right(incoming),
+                    };
+                    let incoming = match next {
+                        future::Either::Left(pack_id) => {
+                            return Some((Received::StickerPackInstalled { pack_id }, state));
+                        }
+                        future::Either::Right(incoming) => incoming,
+                    };
+                    match incoming {
                         Some(Ok(Incoming::Envelope { envelope, ack })) => {
                             let received = async {
                                 // Who sent an unsealed envelope, as the server authenticated it:

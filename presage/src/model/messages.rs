@@ -35,4 +35,8 @@ pub enum Received {
 
     /// Incoming decrypted message with metadata and content
     Content(Box<Content>),
+
+    /// A sticker pack installed on another device (announced in a sync message, which comes as
+    /// [`Received::Content`] first) has been downloaded and stored: it can be listed now.
+    StickerPackInstalled { pack_id: Vec<u8> },
 }

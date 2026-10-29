@@ -19,7 +19,6 @@ use libsignal_service::{
     encrypt_device_name,
     groups_v2::{
         decrypt_group, AccessRequired, GroupInviteLink, GroupJoinInfo, GroupsManager,
-        InMemoryCredentialsCache,
     },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
@@ -59,6 +58,8 @@ use libsignal_service::{
     libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
 };
 use rand::rng;
+
+use super::group_credentials::{GroupCredentialsCache, SharedGroupCredentials};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::sync::Mutex;
@@ -103,6 +104,9 @@ pub struct Registered {
     /// See [`Manager::set_receive_stories`]; shared by the manager's clones.
     pub(crate) receive_stories: Arc<AtomicBool>,
 
+    /// The account's group credentials, which every groups manager made shares.
+    pub(crate) group_credentials: SharedGroupCredentials,
+
     pub(crate) data: Arc<RegistrationData>,
 }
 
@@ -124,6 +128,7 @@ impl Registered {
             session_lock: Default::default(),
             automatic_link_previews: Arc::new(AtomicBool::new(true)),
             receive_stories: Arc::new(AtomicBool::new(false)),
+            group_credentials: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -713,11 +718,11 @@ impl<S: Store> Manager<S, Registered> {
 
     async fn groups_manager(
         &self,
-    ) -> Result<GroupsManager<InMemoryCredentialsCache>, Error<S::Error>> {
+    ) -> Result<GroupsManager<GroupCredentialsCache>, Error<S::Error>> {
         let service_configuration = self.state.service_configuration();
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
-        let groups_credentials_cache = InMemoryCredentialsCache::default();
+        let groups_credentials_cache = self.state.group_credentials.cache();
         let groups_manager = GroupsManager::new(
             self.state.data.service_ids.clone(),
             self.identified_push_service(),
@@ -763,7 +768,7 @@ impl<S: Store> Manager<S, Registered> {
             pni_address: ProtocolAddress,
             /// Decrypted and kept, but not handled before the receiver stopped: handled first.
             decrypted: std::collections::VecDeque<(u64, Content)>,
-            groups_manager: GroupsManager<InMemoryCredentialsCache>,
+            groups_manager: GroupsManager<GroupCredentialsCache>,
             identified_push_service: PushService,
             service_ids: ServiceIds,
             message_sender: MessageSender<AciStore>,
@@ -1787,7 +1792,7 @@ impl<S: Store> Manager<S, Registered> {
     /// The actions, and who is told: members and invitees before the change, plus those added.
     async fn group_change_actions(
         &self,
-        groups_manager: &GroupsManager<InMemoryCredentialsCache>,
+        groups_manager: &GroupsManager<GroupCredentialsCache>,
         operations: &libsignal_service::groups_v2::GroupOperations,
         group: &Group,
         change: GroupEdit,
@@ -2964,7 +2969,7 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
 async fn sync_groups_from_storage_service<S: Store>(
     store: &S,
     push_service: PushService,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
 ) -> Result<(), Error<S::Error>> {
     const READ_CHUNK: usize = 100;
 
@@ -3017,7 +3022,7 @@ async fn sync_groups_from_storage_service<S: Store>(
 /// Incoming messages keep known groups current, so only unknown ones are fetched.
 async fn save_unknown_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key_bytes: &[u8],
 ) -> Result<(), Error<S::Error>> {
     let master_key: GroupMasterKeyBytes = master_key_bytes.try_into()?;
@@ -3044,7 +3049,7 @@ async fn save_unknown_group<S: Store>(
 
 async fn upsert_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
@@ -3782,7 +3787,7 @@ pub enum GroupEdit {
 /// one) is no longer the group's.
 async fn fetch_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key: [u8; 32],
     avatar_path: Option<String>,
 ) -> Result<(), Error<S::Error>> {

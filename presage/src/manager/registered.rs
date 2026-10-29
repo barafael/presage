@@ -2239,6 +2239,18 @@ impl<S: Store> Manager<S, Registered> {
             .ok_or(Error::UnknownGroup)
     }
 
+    /// Brings the stored group up to date from the server's log of its changes, as Signal's
+    /// apps do when its chat opens: what changed since the stored revision, if anything (a
+    /// request to join, say, which nobody tells the admins of). Returns those changes, oldest
+    /// first; fetches the group whole if none is stored or the log can't be read.
+    pub async fn update_group(
+        &mut self,
+        master_key: &[u8; 32],
+    ) -> Result<Vec<MissedGroupChange>, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        update_group(&self.store, &mut groups_manager, master_key, u32::MAX, None).await
+    }
+
     fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

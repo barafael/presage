@@ -39,4 +39,13 @@ pub enum Received {
     /// A sticker pack installed on another device (announced in a sync message, which comes as
     /// [`Received::Content`] first) has been downloaded and stored: it can be listed now.
     StickerPackInstalled { pack_id: Vec<u8> },
+
+    /// Changes to a group that no message told of, oldest first: read from the server's log
+    /// when a message showed the group further on than the stored copy, which is up to date
+    /// with them now. Comes before that message; the change the message carries, if any, isn't
+    /// among them.
+    MissedGroupChanges {
+        master_key: [u8; 32],
+        changes: Vec<libsignal_service::groups_v2::GroupChanges>,
+    },
 }

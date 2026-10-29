@@ -10,6 +10,7 @@ use libsignal_service::master_key::MasterKey;
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, PublicKey, SessionStore};
 use libsignal_service::provisioning::ProvisioningSecrets;
+use libsignal_service::push_service::HIGHEST_KNOWN_CHANGE_EPOCH;
 use libsignal_service::session_lock::SessionLock;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
@@ -18,7 +19,7 @@ use libsignal_service::{
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
     groups_v2::{
-        decrypt_group, AccessRequired, GroupInviteLink, GroupJoinInfo, GroupsManager,
+        decrypt_group, AccessRequired, GroupChanges, GroupInviteLink, GroupJoinInfo, GroupsManager,
     },
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
@@ -776,6 +777,9 @@ impl<S: Store> Manager<S, Registered> {
             /// background: what the stream says with [`Received::StickerPackInstalled`].
             stored_packs: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>,
             stored_packs_sender: futures::channel::mpsc::UnboundedSender<Vec<u8>>,
+            /// What the stream says before the message that brought it to light: the group
+            /// changes no message told of.
+            missed: std::collections::VecDeque<Received>,
         }
 
         /// Handles a decrypted content: stores it, and what else it asks for.
@@ -1037,7 +1041,7 @@ impl<S: Store> Manager<S, Registered> {
                     Some(GroupContextV2 {
                         master_key: Some(master_key_bytes),
                         revision: Some(revision),
-                        ..
+                        group_change,
                     }),
                 ..
             })
@@ -1050,7 +1054,7 @@ impl<S: Store> Manager<S, Registered> {
                                     Some(GroupContextV2 {
                                         master_key: Some(master_key_bytes),
                                         revision: Some(revision),
-                                        ..
+                                        group_change,
                                     }),
                                 ..
                             }),
@@ -1059,18 +1063,34 @@ impl<S: Store> Manager<S, Registered> {
                 ..
             }) = &content.body
             {
-                // there's two things to implement: the group metadata (fetched from HTTP API)
-                // and the group changes, which are part of the protobuf messages
-                // this means we kinda need our own internal representation of groups inside of presage?
-                if let Ok(Some(group)) = upsert_group(
+                match update_group(
                     &state.store,
                     &mut state.groups_manager,
                     master_key_bytes,
-                    revision,
+                    *revision,
+                    group_change.as_deref(),
                 )
                 .await
                 {
-                    trace!(?group, "upserted group");
+                    Ok(read) => {
+                        // The message tells of its own change.
+                        let missed: Vec<_> = read
+                            .into_iter()
+                            .filter(|changes| {
+                                group_change.is_none() || changes.version != *revision
+                            })
+                            .collect();
+                        if let (false, Ok(master_key)) = (
+                            missed.is_empty(),
+                            <[u8; 32]>::try_from(master_key_bytes.as_slice()),
+                        ) {
+                            state.missed.push_back(Received::MissedGroupChanges {
+                                master_key,
+                                changes: missed,
+                            });
+                        }
+                    }
+                    Err(error) => warn!(%error, "failed to update the group"),
                 }
             }
 
@@ -1161,6 +1181,7 @@ impl<S: Store> Manager<S, Registered> {
             registration_type: self.registration_type(),
             stored_packs,
             stored_packs_sender,
+            missed: Default::default(),
         };
 
         debug!("starting to consume incoming message stream");
@@ -1168,6 +1189,9 @@ impl<S: Store> Manager<S, Registered> {
         let incoming_messages_stream = futures::stream::unfold(init, |mut state| {
             async move {
                 loop {
+                    if let Some(received) = state.missed.pop_front() {
+                        return Some((received, state));
+                    }
                     if let Some((id, content)) = state.decrypted.pop_front() {
                         debug!(
                             id,
@@ -1178,7 +1202,7 @@ impl<S: Store> Manager<S, Registered> {
                             error!(%error, "failed to forget a handled message; it is handled again at the next start");
                         }
                         if let Some(received) = received {
-                            return Some((received, state));
+                            state.missed.push_back(received);
                         }
                         continue;
                     }
@@ -1326,7 +1350,9 @@ impl<S: Store> Manager<S, Registered> {
                             }
                             .await;
                             if let Some(received) = received {
-                                return Some((received, state));
+                                // After the changes it brought to light.
+                                state.missed.push_back(received);
+                                continue;
                             }
                         }
                         Some(Ok(Incoming::QueueEmpty)) => {
@@ -1763,7 +1789,16 @@ impl<S: Store> Manager<S, Registered> {
             left.revision = revision;
             self.store.save_group(*master_key, left).await?;
         } else {
-            upsert_group(&self.store, &mut groups_manager, master_key, &revision).await?;
+            // The change the server signed is the next revision: no need to fetch the group.
+            let signed = signed.encode_to_vec();
+            update_group(
+                &self.store,
+                &mut groups_manager,
+                master_key,
+                revision,
+                Some(&signed),
+            )
+            .await?;
         }
         if let GroupEdit::Avatar(avatar) = &change {
             self.store.save_group_avatar(*master_key, avatar).await?;
@@ -3051,40 +3086,115 @@ async fn upsert_group<S: Store>(
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
+    update_group(store, groups_manager, master_key_bytes, *revision, None).await?;
+    Ok(store.group(master_key_bytes.try_into()?).await?)
+}
+
+/// Brings the stored group up to `revision`, as Signal's apps do: by `change`, the change a
+/// message carries, if the server signed it and it is the next revision; else by the server's
+/// log of the changes since the stored revision; else, or with nothing stored, by fetching the
+/// group whole. Returns the changes read from the log, oldest first.
+async fn update_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
+    master_key_bytes: &[u8],
+    revision: u32,
+    change: Option<&[u8]>,
+) -> Result<Vec<GroupChanges>, Error<S::Error>> {
     let master_key: [u8; 32] = master_key_bytes.try_into()?;
-    let (upsert_group, avatar_path) = match store.group(master_key).await {
-        Ok(Some(group)) => {
-            debug!(group_name =% group.title, "loaded group from local db");
-            (group.revision < *revision, Some(group.avatar))
-        }
-        Ok(None) => (true, None),
+    let stored = match store.group(master_key).await {
+        Ok(stored) => stored,
         Err(error) => {
             warn!(%error, "failed to retrieve group from local db");
-            (true, None)
+            None
         }
     };
-
-    if upsert_group {
-        debug!("fetching and saving group");
-        let mut fetched = fetch_group(store, groups_manager, master_key, avatar_path.clone()).await;
-        // Once more if the connection failed: nothing fetches the group again until its next
-        // message, and until then it stays as it was (a member who left, still listed). Not if
-        // the server answered: a refusal (we aren't a member) would be the same again.
-        if fetched
-            .as_ref()
-            .is_err_and(|error| matches!(error, Error::ServiceError(error) if transient(error)))
-        {
-            if let Err(error) = &fetched {
-                warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
+    let Some(mut group) = stored else {
+        fetch_group_whole(store, groups_manager, master_key, None).await;
+        return Ok(Vec::new());
+    };
+    debug!(group_name =% group.title, "loaded group from local db");
+    if group.revision >= revision {
+        return Ok(Vec::new());
+    }
+    let avatar = group.avatar.clone();
+    let signed = change.and_then(|change| {
+        let context = GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision: Some(revision),
+            group_change: Some(change.to_vec()),
+        };
+        match groups_manager.decrypt_group_context(context) {
+            Ok(changes) => changes,
+            Err(error) => {
+                debug!(%error, "a group change that isn't the server's; not applied");
+                None
             }
-            fetched = fetch_group(store, groups_manager, master_key, avatar_path).await;
         }
-        if let Err(error) = fetched {
-            warn!(error = %Causes(&error), "failed to fetch encrypted group");
+    });
+    if let Some(changes) = signed {
+        if changes.change_epoch <= HIGHEST_KNOWN_CHANGE_EPOCH && group.apply(&changes) {
+            debug!(revision = group.revision, "applied the group's change");
+            save_group(store, groups_manager, master_key, group, Some(avatar)).await;
+            return Ok(Vec::new());
         }
     }
+    let read = groups_manager
+        .fetch_group_changes(&mut rand::rng(), &master_key, group.revision + 1, false)
+        .await;
+    match read {
+        Ok(entries) => {
+            debug!(
+                changes = entries.len(),
+                "read the group's changes from its log"
+            );
+            let latest = entries.iter().rev().find_map(|entry| entry.group.clone());
+            if let Some(latest) = latest {
+                save_group(
+                    store,
+                    groups_manager,
+                    master_key,
+                    latest.into(),
+                    Some(avatar),
+                )
+                .await;
+            }
+            Ok(entries
+                .into_iter()
+                .filter_map(|entry| entry.change)
+                .collect())
+        }
+        Err(error) => {
+            warn!(error = %Causes(&error), "failed to read the group's changes; fetching it whole");
+            fetch_group_whole(store, groups_manager, master_key, Some(avatar)).await;
+            Ok(Vec::new())
+        }
+    }
+}
 
-    Ok(store.group(master_key_bytes.try_into()?).await?)
+/// [`fetch_group`], once more if the connection failed: nothing fetches the group again until
+/// its next message, and until then it stays as it was (a member who left, still listed). Not
+/// if the server answered: a refusal (we aren't a member) would be the same again.
+async fn fetch_group_whole<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
+    master_key: [u8; 32],
+    avatar_path: Option<String>,
+) {
+    debug!("fetching and saving group");
+    let mut fetched = fetch_group(store, groups_manager, master_key, avatar_path.clone()).await;
+    if fetched
+        .as_ref()
+        .is_err_and(|error| matches!(error, Error::ServiceError(error) if transient(error)))
+    {
+        if let Err(error) = &fetched {
+            warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
+        }
+        fetched = fetch_group(store, groups_manager, master_key, avatar_path).await;
+    }
+    if let Err(error) = fetched {
+        warn!(error = %Causes(&error), "failed to fetch encrypted group");
+    }
 }
 
 /// Whether `error` is the connection's, not the server's answer: worth sending again.
@@ -3781,8 +3891,7 @@ pub enum GroupEdit {
     DenyRequest(Aci),
 }
 
-/// Fetches the group and stores it, refreshing the cached avatar if `avatar_path` (the stored
-/// one) is no longer the group's.
+/// Fetches the group and stores it, as [`save_group`] does.
 async fn fetch_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<GroupCredentialsCache>,
@@ -3793,6 +3902,19 @@ async fn fetch_group<S: Store>(
         .fetch_encrypted_group(&mut rand::rng(), &master_key)
         .await?;
     let group = decrypt_group(&master_key, encrypted_group)?;
+    save_group(store, groups_manager, master_key, group.into(), avatar_path).await;
+    Ok(())
+}
+
+/// Stores the group, refreshing the cached avatar if `avatar_path` (the stored one) is no
+/// longer the group's.
+async fn save_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
+    master_key: [u8; 32],
+    group: Group,
+    avatar_path: Option<String>,
+) {
     // A new picture, or none any more: the cached one is stale.
     if avatar_path.is_some_and(|path| path != group.avatar) {
         let avatar = if group.avatar.is_empty() {
@@ -3815,7 +3937,6 @@ async fn fetch_group<S: Store>(
     if let Err(error) = store.save_group(master_key, group).await {
         error!(%error, "failed to save group");
     }
-    Ok(())
 }
 
 /// How [`Manager::join_group`] went.

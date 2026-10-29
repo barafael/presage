@@ -644,8 +644,8 @@ async fn receive<S: Store>(
                 for change in changes {
                     println!(
                         "missed a group's revision {}: {} changes",
-                        change.version,
-                        change.changes.len()
+                        change.changes.version,
+                        change.changes.changes.len()
                     )
                 }
             }

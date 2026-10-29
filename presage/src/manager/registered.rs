@@ -18,9 +18,7 @@ use libsignal_service::{
     configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     encrypt_device_name,
-    groups_v2::{
-        decrypt_group, AccessRequired, GroupChanges, GroupInviteLink, GroupJoinInfo, GroupsManager,
-    },
+    groups_v2::{decrypt_group, AccessRequired, GroupInviteLink, GroupJoinInfo, GroupsManager},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
@@ -78,7 +76,7 @@ use libsignal_service::master_key::StorageServiceKey;
 use libsignal_service::proto::{manifest_record, storage_record};
 use libsignal_service::StorageService;
 
-pub use crate::model::messages::Received;
+pub use crate::model::messages::{MissedGroupChange, Received};
 
 type ServiceCipher<S> = cipher::ServiceCipher<S>;
 type MessageSender<S> = libsignal_service::prelude::MessageSender<S>;
@@ -1077,7 +1075,7 @@ impl<S: Store> Manager<S, Registered> {
                         let missed: Vec<_> = read
                             .into_iter()
                             .filter(|changes| {
-                                group_change.is_none() || changes.version != *revision
+                                group_change.is_none() || changes.changes.version != *revision
                             })
                             .collect();
                         if let (false, Ok(master_key)) = (
@@ -3100,7 +3098,7 @@ async fn update_group<S: Store>(
     master_key_bytes: &[u8],
     revision: u32,
     change: Option<&[u8]>,
-) -> Result<Vec<GroupChanges>, Error<S::Error>> {
+) -> Result<Vec<MissedGroupChange>, Error<S::Error>> {
     let master_key: [u8; 32] = master_key_bytes.try_into()?;
     let stored = match store.group(master_key).await {
         Ok(stored) => stored,
@@ -3161,7 +3159,12 @@ async fn update_group<S: Store>(
             }
             Ok(entries
                 .into_iter()
-                .filter_map(|entry| entry.change)
+                .filter_map(|entry| {
+                    Some(MissedGroupChange {
+                        changes: entry.change?,
+                        signed: entry.signed_change?,
+                    })
+                })
                 .collect())
         }
         Err(error) => {

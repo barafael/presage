@@ -46,6 +46,15 @@ pub enum Received {
     /// among them.
     MissedGroupChanges {
         master_key: [u8; 32],
-        changes: Vec<libsignal_service::groups_v2::GroupChanges>,
+        changes: Vec<MissedGroupChange>,
     },
+}
+
+/// A group change no message told of.
+#[derive(Debug, Clone)]
+pub struct MissedGroupChange {
+    pub changes: libsignal_service::groups_v2::GroupChanges,
+    /// As the server signed it, encrypted: what a message telling of it would have carried in
+    /// its [`GroupContextV2`](libsignal_service::proto::GroupContextV2).
+    pub signed: libsignal_service::proto::GroupChange,
 }

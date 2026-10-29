@@ -2594,6 +2594,18 @@ impl<S: Store> Manager<S, Registered> {
         None
     }
 
+    /// Makes the group's sender key anew: the next message to the group hands it to every
+    /// member's devices again. For when one of them couldn't decrypt a message sent with it (a
+    /// retry receipt without a ratchet key), lacking the key.
+    pub async fn renew_sender_key(&self, master_key: &[u8; 32]) -> Result<(), Error<S::Error>> {
+        let key = GroupSenderKey {
+            distribution_id: random_uuid(),
+            created_at: Self::now(),
+        };
+        self.store.save_group_sender_key(*master_key, key).await?;
+        Ok(())
+    }
+
     /// The group's sender key, made anew if there is none, if it is older than
     /// [`SENDER_KEY_MAX_AGE`], or if someone it was shared with is no longer among `members`.
     async fn current_sender_key(

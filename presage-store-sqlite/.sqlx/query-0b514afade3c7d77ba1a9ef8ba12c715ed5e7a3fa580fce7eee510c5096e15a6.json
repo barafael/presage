@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM group_sender_keys",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "0b514afade3c7d77ba1a9ef8ba12c715ed5e7a3fa580fce7eee510c5096e15a6"
+}

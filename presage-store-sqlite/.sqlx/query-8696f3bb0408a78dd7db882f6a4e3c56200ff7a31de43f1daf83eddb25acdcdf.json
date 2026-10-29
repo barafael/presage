@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO sender_key_shared\n                    (distribution_id, service_id, device_id, registration_id) VALUES (?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "8696f3bb0408a78dd7db882f6a4e3c56200ff7a31de43f1daf83eddb25acdcdf"
+}

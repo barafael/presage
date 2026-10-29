@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO group_sender_keys (master_key, distribution_id, created_at)\n                VALUES (?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "ea9e21603b0a7c880fe0240607be35736de6dc2d7d626b762e30a5bbd225f2e9"
+}

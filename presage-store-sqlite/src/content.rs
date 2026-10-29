@@ -9,7 +9,10 @@ use presage::{
         protocol::ServiceId,
         zkgroup::GroupMasterKeyBytes,
     },
-    model::{contacts::Contact, groups::Group},
+    model::{
+        contacts::Contact,
+        groups::{Group, GroupSenderKey, SharedDevice},
+    },
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
 };
@@ -553,6 +556,12 @@ impl ContentsStore for SqliteStore {
         query!("DELETE FROM left_groups")
             .execute(&mut *transaction)
             .await?;
+        query!("DELETE FROM group_sender_keys")
+            .execute(&mut *transaction)
+            .await?;
+        query!("DELETE FROM sender_key_shared")
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await.into_protocol_error()?;
         Ok(())
     }
@@ -696,6 +705,106 @@ impl ContentsStore for SqliteStore {
         .fetch_optional(&self.db)
         .await
         .map_err(From::from)
+    }
+
+    async fn group_sender_key(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> Result<Option<GroupSenderKey>, Self::ContentsStoreError> {
+        let master_key = master_key.as_slice();
+        let Some(row) = query!(
+            "SELECT distribution_id, created_at FROM group_sender_keys WHERE master_key = ?",
+            master_key,
+        )
+        .fetch_optional(&self.db)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let Ok(distribution_id) = Uuid::parse_str(&row.distribution_id) else {
+            return Ok(None);
+        };
+        Ok(Some(GroupSenderKey {
+            distribution_id,
+            created_at: row.created_at.try_into().unwrap_or_default(),
+        }))
+    }
+
+    async fn save_group_sender_key(
+        &self,
+        master_key: GroupMasterKeyBytes,
+        key: GroupSenderKey,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let master_key = master_key.as_slice();
+        let distribution_id = key.distribution_id.to_string();
+        let created_at = i64::try_from(key.created_at).unwrap_or(i64::MAX);
+        let mut transaction = self.begin_write().await?;
+        query!(
+            "DELETE FROM sender_key_shared WHERE distribution_id IN
+                (SELECT distribution_id FROM group_sender_keys WHERE master_key = ?)",
+            master_key,
+        )
+        .execute(&mut *transaction)
+        .await?;
+        query!(
+            "INSERT OR REPLACE INTO group_sender_keys (master_key, distribution_id, created_at)
+                VALUES (?, ?, ?)",
+            master_key,
+            distribution_id,
+            created_at,
+        )
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn sender_key_shared(
+        &self,
+        distribution_id: Uuid,
+    ) -> Result<Vec<SharedDevice>, Self::ContentsStoreError> {
+        let distribution_id = distribution_id.to_string();
+        let rows = query!(
+            "SELECT service_id, device_id, registration_id FROM sender_key_shared
+                WHERE distribution_id = ?",
+            distribution_id,
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(SharedDevice {
+                    service_id: ServiceId::parse_from_service_id_string(&row.service_id)?,
+                    device_id: row.device_id.try_into().ok()?,
+                    registration_id: row.registration_id.try_into().ok()?,
+                })
+            })
+            .collect())
+    }
+
+    async fn share_sender_key(
+        &self,
+        distribution_id: Uuid,
+        devices: &[SharedDevice],
+    ) -> Result<(), Self::ContentsStoreError> {
+        let distribution_id = distribution_id.to_string();
+        let mut transaction = self.begin_write().await?;
+        for device in devices {
+            let service_id = device.service_id.service_id_string();
+            query!(
+                "INSERT OR REPLACE INTO sender_key_shared
+                    (distribution_id, service_id, device_id, registration_id) VALUES (?, ?, ?, ?)",
+                distribution_id,
+                service_id,
+                device.device_id,
+                device.registration_id,
+            )
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     async fn upsert_profile_key(

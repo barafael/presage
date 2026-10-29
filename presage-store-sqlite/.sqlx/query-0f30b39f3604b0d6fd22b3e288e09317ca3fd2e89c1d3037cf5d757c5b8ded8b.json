@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM sender_key_shared WHERE distribution_id IN\n                (SELECT distribution_id FROM group_sender_keys WHERE master_key = ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "0f30b39f3604b0d6fd22b3e288e09317ca3fd2e89c1d3037cf5d757c5b8ded8b"
+}

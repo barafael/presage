@@ -320,6 +320,23 @@ impl From<libsignal_service::groups_v2::AccessControl> for AccessControl {
     }
 }
 
+/// The sender key a group's messages go with: its distribution id, and when our key for it was
+/// made, in milliseconds since the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupSenderKey {
+    pub distribution_id: Uuid,
+    pub created_at: u64,
+}
+
+/// A device our sender key was sent to, as it was then: its registration id changes when it is
+/// set up again, and the new one needs the key anew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedDevice {
+    pub service_id: ServiceId,
+    pub device_id: u32,
+    pub registration_id: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use libsignal_service::groups_v2::{self, AccessRequired, GroupChange, GroupChanges, Role};

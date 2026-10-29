@@ -100,6 +100,8 @@ pub struct Registered {
     pub(crate) session_lock: SessionLock,
     /// See [`Manager::set_automatic_link_previews`]; shared by the manager's clones.
     pub(crate) automatic_link_previews: Arc<AtomicBool>,
+    /// See [`Manager::set_receive_stories`]; shared by the manager's clones.
+    pub(crate) receive_stories: Arc<AtomicBool>,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -121,6 +123,7 @@ impl Registered {
             link_preview_client: Default::default(),
             session_lock: Default::default(),
             automatic_link_previews: Arc::new(AtomicBool::new(true)),
+            receive_stories: Arc::new(AtomicBool::new(false)),
             data: Arc::new(data),
         }
     }
@@ -219,6 +222,14 @@ impl<S> Manager<S, Registered> {
             .automatic_link_previews
             .store(enabled, Ordering::Relaxed);
     }
+
+    /// Whether the server delivers stories to this device (`X-Signal-Receive-Stories`). Off by
+    /// default: the server then drops every story sent to it, unread. An app that shows stories
+    /// turns it on before it receives; it applies from the next connection on, and to this
+    /// manager's clones too.
+    pub fn set_receive_stories(&self, enabled: bool) {
+        self.state.receive_stories.store(enabled, Ordering::Relaxed);
+    }
 }
 
 impl<S: Store> Manager<S, Registered> {
@@ -297,7 +308,12 @@ impl<S: Store> Manager<S, Registered> {
         {
             Some(ws) => Ok(ws.clone()),
             None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
+                let receive_stories = if self.state.receive_stories.load(Ordering::Relaxed) {
+                    "true"
+                } else {
+                    "false"
+                };
+                let headers = &[("X-Signal-Receive-Stories", receive_stories)];
                 let ws = self
                     .identified_push_service()
                     .ws(

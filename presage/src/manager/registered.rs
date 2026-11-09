@@ -13,7 +13,7 @@ use libsignal_service::session_lock::SessionLock;
 use libsignal_service::{
     attachment_cipher::decrypt_in_place,
     cipher,
-    configuration::{ServiceConfiguration, SignalServers},
+    configuration::{Endpoint, ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
     groups_v2::{decrypt_group, GroupsManager},
     messagepipe::ServiceCredentials,
@@ -28,7 +28,7 @@ use libsignal_service::{
     },
     protocol::{Aci, DeviceId, IdentityKeyStore, SenderCertificate, ServiceId, Username},
     provisioning::ProvisioningError,
-    push_service::{PushService, ServiceIds, DEFAULT_DEVICE_ID},
+    push_service::{HttpAuthOverride, PushService, ServiceError, ServiceIds, DEFAULT_DEVICE_ID},
     sender::{AttachmentSpec, AttachmentUploadError},
     sticker_cipher::derive_key,
     unidentified_access::UnidentifiedAccess,
@@ -251,8 +251,9 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Returns a clone of a cached push service (with credentials).
     ///
-    /// If no service is yet cached, it will create and cache one.
-    fn identified_push_service(&self) -> PushService {
+    /// If no service is yet cached, it will create and cache one. Public for requests presage
+    /// doesn't make itself, such as asking for a sticker pack's upload forms.
+    pub fn identified_push_service(&self) -> PushService {
         self.state.identified_push_service()
     }
 
@@ -386,6 +387,45 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
+    /// For editing records without decoding them. `None` as for [`Self::storage_service`].
+    pub async fn storage_access(
+        &self,
+    ) -> Result<
+        Option<(
+            libsignal_service::push_service::PushService,
+            libsignal_service::master_key::StorageServiceKey,
+        )>,
+        Error<S::Error>,
+    > {
+        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
+        let Some(pool) = self.account_entropy_pool().await? else {
+            return Ok(None);
+        };
+        let master_key =
+            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
+        Ok(Some((
+            self.identified_push_service(),
+            StorageServiceKey::from_master_key(&master_key),
+        )))
+    }
+
+    /// `None` until the primary device has sent the account entropy pool.
+    pub async fn storage_service(
+        &self,
+    ) -> Result<Option<libsignal_service::StorageService>, Error<S::Error>> {
+        let Some(pool) = self.account_entropy_pool().await? else {
+            return Ok(None);
+        };
+        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
+        // The SVR key is the account's master key.
+        let master_key =
+            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
+        let key = StorageServiceKey::from_master_key(&master_key);
+        let service =
+            libsignal_service::StorageService::new(self.identified_push_service(), key).await?;
+        Ok(Some(service))
+    }
+
     async fn account_entropy_pool(&self) -> Result<Option<AccountEntropyPool>, Error<S::Error>> {
         let from_store = self.store().fetch_account_entropy_pool().await?;
 
@@ -464,6 +504,45 @@ impl<S: Store> Manager<S, Registered> {
             .store
             .save_profile(aci.into(), profile_key, profile.clone())
             .await;
+        Ok(profile)
+    }
+
+    /// Fetches the profile of `aci` from the server even when one is cached, and caches it:
+    /// a new picture or name doesn't change the profile key, so the cached one may be out of
+    /// date. A changed avatar is downloaded and cached too.
+    pub async fn refresh_profile(
+        &mut self,
+        aci: impl Into<Aci>,
+        profile_key: ProfileKey,
+    ) -> Result<Profile, Error<S::Error>> {
+        let aci = aci.into();
+        let cached = self
+            .store
+            .profile(aci.into(), profile_key)
+            .await
+            .ok()
+            .flatten();
+
+        let mut account_manager = AccountManager::new(
+            self.identified_push_service(),
+            self.identified_websocket(false).await?,
+            Some(profile_key),
+        );
+        let profile = account_manager.retrieve_profile(aci).await?;
+        let _ = self
+            .store
+            .save_profile(aci.into(), profile_key, profile.clone())
+            .await;
+
+        let avatar_changed =
+            cached.as_ref().map(|cached| cached.avatar.as_ref()) != Some(profile.avatar.as_ref());
+        if let Some(avatar) = profile.avatar.as_ref().filter(|_| avatar_changed) {
+            let avatar = self.download_avatar(avatar, profile_key).await?;
+            let _ = self
+                .store
+                .save_profile_avatar(aci.into(), profile_key, &avatar)
+                .await;
+        }
         Ok(profile)
     }
 
@@ -556,8 +635,19 @@ impl<S: Store> Manager<S, Registered> {
         uuid: Uuid,
         profile_key: ProfileKey,
     ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
-        // Check if profile avatar is cached.
-        // TODO: Is there some way to know if this is outdated?
+        let profile =
+            if let Some(profile) = self.store.profile(uuid, profile_key).await.ok().flatten() {
+                profile
+            } else {
+                self.retrieve_profile_by_uuid(uuid, profile_key).await?
+            };
+
+        // A profile without one has none, whatever was cached before it was removed.
+        let Some(avatar) = profile.avatar.as_ref() else {
+            return Ok(None);
+        };
+
+        // Kept up to date by `refresh_profile`.
         if let Some(avatar) = self
             .store
             .profile_avatar(uuid, profile_key)
@@ -568,17 +658,20 @@ impl<S: Store> Manager<S, Registered> {
             return Ok(Some(avatar));
         }
 
-        let profile =
-            if let Some(profile) = self.store.profile(uuid, profile_key).await.ok().flatten() {
-                profile
-            } else {
-                self.retrieve_profile_by_uuid(uuid, profile_key).await?
-            };
+        let avatar = self.download_avatar(avatar, profile_key).await?;
+        let _ = self
+            .store
+            .save_profile_avatar(uuid, profile_key, &avatar)
+            .await;
+        Ok(Some(avatar))
+    }
 
-        let Some(avatar) = profile.avatar.as_ref() else {
-            return Ok(None);
-        };
-
+    /// Downloads and decrypts the profile avatar at the CDN path `avatar`.
+    async fn download_avatar(
+        &mut self,
+        avatar: &str,
+        profile_key: ProfileKey,
+    ) -> Result<AvatarBytes, Error<S::Error>> {
         let mut websocket = self.unidentified_websocket().await?;
 
         let mut avatar_stream = websocket.retrieve_profile_avatar(avatar).await?;
@@ -588,13 +681,7 @@ impl<S: Store> Manager<S, Registered> {
         contents.truncate(len);
 
         let cipher = ProfileCipher::new(profile_key);
-
-        let avatar = cipher.decrypt_avatar(&contents)?;
-        let _ = self
-            .store
-            .save_profile_avatar(uuid, profile_key, &avatar)
-            .await;
-        Ok(Some(avatar))
+        Ok(cipher.decrypt_avatar(&contents)?)
     }
 
     async fn groups_manager(
@@ -1407,6 +1494,78 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
         Ok(())
     }
+    /// Waits up to `timeout` for the primary device to upload the history archive; `Ok(None)`
+    /// if it hasn't yet. Keep `timeout` well below the HTTP client's 65 seconds.
+    pub async fn transfer_archive(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<TransferArchive>, Error<S::Error>> {
+        let response = self
+            .identified_push_service()
+            .request(
+                reqwest::Method::GET,
+                Endpoint::service(format!(
+                    "/v1/devices/transfer_archive?timeout={}",
+                    timeout.as_secs().max(1)
+                )),
+                HttpAuthOverride::NoOverride,
+            )?
+            .send()
+            .await
+            .map_err(ServiceError::from)?;
+        match response.status() {
+            reqwest::StatusCode::NO_CONTENT => Ok(None),
+            reqwest::StatusCode::OK => {
+                let body = response.bytes().await.map_err(ServiceError::from)?;
+                let archive: TransferArchiveResponse = serde_json::from_slice(&body)?;
+                Ok(Some(archive.into()))
+            }
+            status => Err(ServiceError::UnhandledResponseCode {
+                status,
+                body: response.text().await.unwrap_or_default(),
+            }
+            .into()),
+        }
+    }
+}
+
+/// See [`Manager::transfer_archive`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferArchive {
+    /// Download from `attachments/{key}` on CDN `cdn`.
+    Uploaded { cdn: u32, key: String },
+    /// The user asked to try linking again.
+    RelinkRequested,
+    /// The upload failed and the user chose to continue without history.
+    ContinueWithoutUpload,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TransferArchiveResponse {
+    Uploaded { cdn: u32, key: String },
+    Error { error: TransferArchiveError },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TransferArchiveError {
+    RelinkRequested,
+    ContinueWithoutUpload,
+}
+
+impl From<TransferArchiveResponse> for TransferArchive {
+    fn from(response: TransferArchiveResponse) -> Self {
+        match response {
+            TransferArchiveResponse::Uploaded { cdn, key } => Self::Uploaded { cdn, key },
+            TransferArchiveResponse::Error {
+                error: TransferArchiveError::RelinkRequested,
+            } => Self::RelinkRequested,
+            TransferArchiveResponse::Error {
+                error: TransferArchiveError::ContinueWithoutUpload,
+            } => Self::ContinueWithoutUpload,
+        }
+    }
 }
 
 /// Set the timestamp in any DataMessage so it matches its envelope's
@@ -1707,4 +1866,34 @@ async fn upsert_contact_from_profile<S: Store>(
         debug!("not storing profile for PNI contact");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod transfer_archive_tests {
+    use super::{TransferArchive, TransferArchiveResponse};
+
+    fn parse(json: &str) -> TransferArchive {
+        serde_json::from_str::<TransferArchiveResponse>(json)
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn parses_all_server_responses() {
+        assert_eq!(
+            parse(r#"{"cdn":3,"key":"abc-_123"}"#),
+            TransferArchive::Uploaded {
+                cdn: 3,
+                key: "abc-_123".into()
+            }
+        );
+        assert_eq!(
+            parse(r#"{"error":"RELINK_REQUESTED"}"#),
+            TransferArchive::RelinkRequested
+        );
+        assert_eq!(
+            parse(r#"{"error":"CONTINUE_WITHOUT_UPLOAD"}"#),
+            TransferArchive::ContinueWithoutUpload
+        );
+    }
 }

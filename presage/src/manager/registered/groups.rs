@@ -8,7 +8,7 @@ use libsignal_service::{
     groups_v2::{decrypt_group, AccessRequired, GroupInviteLink, GroupJoinInfo, GroupsManager},
     prelude::{MessageSenderError, ProtobufMessage, Uuid},
     proto::{DataMessage, GroupContextV2},
-    protocol::{Aci, ServiceId},
+    protocol::{Aci, DeviceId, ServiceId},
     push_service::ServiceError,
     unidentified_access::UnidentifiedAccess,
     zkgroup::{
@@ -19,9 +19,10 @@ use libsignal_service::{
 use rand::rng;
 use tracing::{debug, error, warn};
 
-use super::{ensure_data_message_timestamp, upsert_group, Registered};
+use super::{ensure_data_message_timestamp, upsert_group, MessageSender, Registered};
 
 use crate::manager::group_credentials::GroupCredentialsCache;
+use crate::model::groups::{GroupSenderKey, SharedDevice};
 use crate::model::messages::MissedGroupChange;
 use crate::store::{Store, Thread};
 use crate::{model::groups::Group, Error, Manager};
@@ -723,6 +724,164 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
         Ok(())
     }
+
+    /// [`Self::send_message_to_group`]'s sends with our sender key, as Signal's apps send to a
+    /// group: the key to whichever of the members' devices lack it, then the message, encrypted
+    /// once, in one request. None if it can't go so (a member without an access key, fewer than
+    /// two members, a refusal): then it goes to each member in turn.
+    ///
+    /// The key is made anew when someone it was shared with is no longer a member, and after
+    /// [`SENDER_KEY_MAX_AGE`].
+    pub(super) async fn send_with_sender_key(
+        &mut self,
+        sender: &mut MessageSender<S::AciStore>,
+        master_key: [u8; 32],
+        recipients: &[(ServiceId, Option<UnidentifiedAccess>, bool)],
+        content_body: &ContentBody,
+        timestamp: u64,
+    ) -> Option<Vec<libsignal_service::sender::SendMessageResult>> {
+        use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+        const ATTEMPTS: usize = 3;
+
+        let recipients: Vec<(ServiceId, UnidentifiedAccess)> = recipients
+            .iter()
+            .map(|(recipient, access, _)| Some((*recipient, access.clone()?)))
+            .collect::<Option<_>>()?;
+        if recipients.len() < 2 {
+            return None;
+        }
+        let members: std::collections::HashSet<ServiceId> =
+            recipients.iter().map(|(recipient, _)| *recipient).collect();
+        let now = Self::now();
+        let key = match self.current_sender_key(master_key, &members, now).await {
+            Ok(key) => key,
+            Err(error) => {
+                warn!(%error, "no sender key for the group; to each member instead");
+                return None;
+            }
+        };
+        let distribution_id = key.distribution_id;
+        let group_id = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key))
+            .get_group_identifier();
+        let distribution = match sender
+            .sender_key_distribution_message(distribution_id)
+            .await
+        {
+            Ok(distribution) => distribution,
+            Err(error) => {
+                warn!(%error, "no sender key distribution; to each member instead");
+                return None;
+            }
+        };
+        let story = matches!(content_body, ContentBody::StoryMessage(_));
+        for _ in 0..ATTEMPTS {
+            let shared = self.store.sender_key_shared(distribution_id).await.ok()?;
+            for (recipient, access) in &recipients {
+                let has_it = |devices: &[(DeviceId, u32)]| {
+                    devices.iter().all(|(device, registration_id)| {
+                        shared.contains(&SharedDevice {
+                            service_id: *recipient,
+                            device_id: (*device).into(),
+                            registration_id: *registration_id,
+                        })
+                    })
+                };
+                let devices = sender.sender_key_devices(*recipient).await.ok()?;
+                if has_it(&devices) {
+                    continue;
+                }
+                match sender
+                    .send_sender_key_distribution(*recipient, Some(access), &distribution, now)
+                    .await
+                {
+                    Ok(_) => {}
+                    // Not registered: the send says so too.
+                    Err(MessageSenderError::NotFound { .. }) => continue,
+                    Err(error) => {
+                        warn!(%error, "failed to send our sender key; to each member instead");
+                        return None;
+                    }
+                }
+                // Its devices as the send left them: it mends what the server says changed.
+                let devices: Vec<SharedDevice> = sender
+                    .sender_key_devices(*recipient)
+                    .await
+                    .ok()?
+                    .into_iter()
+                    .map(|(device, registration_id)| SharedDevice {
+                        service_id: *recipient,
+                        device_id: device.into(),
+                        registration_id,
+                    })
+                    .collect();
+                self.store
+                    .share_sender_key(distribution_id, &devices)
+                    .await
+                    .ok()?;
+            }
+            match sender
+                .send_with_sender_key(
+                    distribution_id,
+                    &group_id,
+                    &recipients,
+                    content_body,
+                    timestamp,
+                    false,
+                    !story,
+                )
+                .await
+            {
+                Ok(results) => return Some(results),
+                Err(MessageSenderError::SenderKeyDevicesChanged) => {
+                    debug!("a member's devices changed; sending again");
+                }
+                Err(error) => {
+                    warn!(%error, "failed to send with our sender key; to each member instead");
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Makes the group's sender key anew: the next message to the group hands it to every
+    /// member's devices again. For when one of them couldn't decrypt a message sent with it (a
+    /// retry receipt without a ratchet key), lacking the key.
+    pub async fn renew_sender_key(&self, master_key: &[u8; 32]) -> Result<(), Error<S::Error>> {
+        let key = GroupSenderKey {
+            distribution_id: random_uuid(),
+            created_at: Self::now(),
+        };
+        self.store.save_group_sender_key(*master_key, key).await?;
+        Ok(())
+    }
+
+    /// The group's sender key, made anew if there is none, if it is older than
+    /// [`SENDER_KEY_MAX_AGE`], or if someone it was shared with is no longer among `members`.
+    async fn current_sender_key(
+        &mut self,
+        master_key: [u8; 32],
+        members: &std::collections::HashSet<ServiceId>,
+        now: u64,
+    ) -> Result<GroupSenderKey, S::Error> {
+        if let Some(key) = self.store.group_sender_key(master_key).await? {
+            let young = now.saturating_sub(key.created_at) < SENDER_KEY_MAX_AGE;
+            let shared = self.store.sender_key_shared(key.distribution_id).await?;
+            let gone = shared
+                .iter()
+                .any(|device| !members.contains(&device.service_id));
+            if young && !gone {
+                return Ok(key);
+            }
+            debug!(young, gone, "making the group's sender key anew");
+        }
+        let key = GroupSenderKey {
+            distribution_id: random_uuid(),
+            created_at: now,
+        };
+        self.store.save_group_sender_key(master_key, key).await?;
+        Ok(key)
+    }
 }
 
 /// Brings the stored group up to `revision`, as Signal's apps do: by `change`, the change a
@@ -836,6 +995,17 @@ async fn fetch_group_whole<S: Store>(
         warn!(error = %Causes(&error), "failed to fetch encrypted group");
     }
 }
+
+/// A random (version 4) UUID, as Signal's apps make a distribution id.
+fn random_uuid() -> Uuid {
+    const VERSION: u128 = 0xf << 76;
+    const VARIANT: u128 = 0x3 << 62;
+    Uuid::from_u128((rand::random::<u128>() & !VERSION & !VARIANT) | (0x4 << 76) | (0x2 << 62))
+}
+
+/// How long the sender key a group's messages go with is kept. Signal-Desktop takes its age from
+/// remote config (`desktop.senderKeyMaxAge`) and keeps one 90 days at most.
+const SENDER_KEY_MAX_AGE: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Whether `error` is the connection's, not the server's answer: worth sending again.
 fn transient(error: &ServiceError) -> bool {
@@ -1093,6 +1263,18 @@ pub enum GroupJoin {
     /// An administrator has to let us in. Meanwhile the group is stored with what the link
     /// shows of it, and us among its requesting members.
     Requested,
+}
+
+#[cfg(test)]
+mod distribution_id_tests {
+    #[test]
+    fn a_distribution_id_is_a_random_uuid() {
+        let id = super::random_uuid();
+        assert_eq!(id.get_version_num(), 4);
+        // The RFC 4122 variant: 0b10 in the top bits of the eighth byte.
+        assert_eq!(id.as_bytes()[8] >> 6, 0b10);
+        assert_ne!(id, super::random_uuid());
+    }
 }
 
 #[cfg(test)]

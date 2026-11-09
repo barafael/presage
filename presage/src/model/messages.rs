@@ -3,6 +3,8 @@ use libsignal_service::{
     protocol::ServiceId,
 };
 
+use crate::manager::Kept;
+
 #[derive(Debug)]
 pub enum Received {
     /// when the receive loop is empty, happens when opening the websocket for the first time
@@ -23,6 +25,9 @@ pub enum Received {
     // A session reset with the contact may fix this.
     DecryptionError(ServiceId),
 
-    /// Incoming decrypted message with metadata and content
-    Content(Box<Content>),
+    /// Incoming decrypted message with metadata and content, and what was kept of it.
+    Content {
+        content: Box<Content>,
+        kept: Kept,
+    },
 }

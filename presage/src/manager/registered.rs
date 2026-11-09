@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
 use futures::{future, AsyncReadExt};
+use libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::provisioning::ProvisioningSecrets;
@@ -17,7 +18,6 @@ use libsignal_service::{
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
     proto::{
-        data_message::Delete,
         sync_message::{
             self, sticker_pack_operation, Content as SyncContent, StickerPackOperation,
         },
@@ -44,9 +44,6 @@ use libsignal_service::{
     },
     AccountManager, Profile, ServiceIdExt,
 };
-use libsignal_service::{
-    libsignal_account_keys::AccountEntropyPool, proto::addressable_message::Author,
-};
 use rand::rng;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -56,6 +53,7 @@ use url::Url;
 
 mod receive;
 
+use super::keep::{keep, Kept};
 use super::settings::{Settings, SharedSettings};
 use crate::model::contacts::Contact;
 use crate::model::previews;
@@ -729,7 +727,7 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
-            content,
+            &content,
             Some(thread),
         )
         .await?;
@@ -924,7 +922,7 @@ impl<S: Store> Manager<S, Registered> {
         save_message(
             &mut self.store,
             &mut identified_websocket,
-            content,
+            &content,
             Some(thread),
         )
         .await?;
@@ -1176,13 +1174,7 @@ impl<S: Store> Manager<S, Registered> {
         };
 
         let mut identified_websocket = self.identified_websocket(false).await?;
-        save_message(
-            &mut self.store,
-            &mut identified_websocket,
-            content.clone(),
-            None,
-        )
-        .await?;
+        save_message(&mut self.store, &mut identified_websocket, &content, None).await?;
         Ok(content)
     }
 
@@ -1600,54 +1592,47 @@ async fn download_sticker<C: ContentsStore>(
     Ok(ciphertext)
 }
 
-/// Save a message into the store.
-/// Note that `override_thread` can be used to specify the thread the message will be stored in.
-/// This is required when storing outgoing messages, as in this case the appropriate storage place cannot be derived from the message itself.
+/// Keeps `message` as [`keep`] does, its sender's profile key first: sending to them by sealed
+/// sender needs it. A new sender, or one with a new key, gets their profile fetched in the
+/// background.
 async fn save_message<S: Store>(
     store: &mut S,
     identified_websocket: &mut websocket::SignalWebSocket<websocket::Identified>,
-    message: Content,
+    message: &Content,
     override_thread: Option<Thread>,
-) -> Result<(), Error<S::Error>> {
-    // derive the thread from the message type
-    let thread = override_thread.unwrap_or(Thread::try_from(&message)?);
+) -> Result<Kept, Error<S::Error>> {
+    let thread = match override_thread {
+        Some(thread) => thread,
+        None => Thread::try_from(message)?,
+    };
+    if let ContentBody::DataMessage(data_message)
+    | ContentBody::SynchronizeMessage(SyncMessage {
+        content:
+            Some(SyncContent::Sent(sync_message::Sent {
+                message: Some(data_message),
+                ..
+            })),
+        ..
+    }) = &message.body
+    {
+        if let Some(profile_key_bytes) = data_message
+            .profile_key
+            .clone()
+            .and_then(|p| p.try_into().ok())
+        {
+            let sender = message.metadata.sender;
+            let profile_key = ProfileKey::create(profile_key_bytes);
+            let changed = store
+                .profile_key(&sender)
+                .await?
+                .is_none_or(|known| known.bytes != profile_key.bytes);
 
-    // only save DataMessage and SynchronizeMessage (sent)
-    let message = match message.body {
-        ContentBody::DecryptionErrorMessage(e) => {
-            warn!(error = ?e, "was asked to save a DecryptionErrorMessage; this should not happen");
-            None
-        }
-        ContentBody::NullMessage(_) => Some(message),
-        ContentBody::DataMessage(
-            ref data_message @ DataMessage {
-                ref profile_key, ..
-            },
-        )
-        | ContentBody::SynchronizeMessage(SyncMessage {
-            content:
-                Some(SyncContent::Sent(sync_message::Sent {
-                    message:
-                        Some(
-                            ref data_message @ DataMessage {
-                                ref profile_key, ..
-                            },
-                        ),
-                    ..
-                })),
-            ..
-        }) => {
-            // update recipient profile key if changed
-            if let Some(profile_key_bytes) = profile_key.clone().and_then(|p| p.try_into().ok()) {
-                let sender = message.metadata.sender;
-                let profile_key = ProfileKey::create(profile_key_bytes);
+            if let (true, Some(aci)) = (changed, sender.aci()) {
                 debug!(sender = %sender.service_id_string(), "inserting profile key for");
+                store.upsert_profile_key(&aci.into(), profile_key).await?;
+            }
 
-                // Either:
-                // - insert a new contact with the profile information
-                // - update the contact if the profile key has changed
-                // TODO: mark this contact as "created by us" maybe to know whether we should update it or not
-                // NOTE: this needs to happen in the background!
+            if changed || store.contact_by_id(&sender).await?.is_none() {
                 let store_inner = store.clone();
                 let websocket_inner = identified_websocket.clone();
                 let data_message_inner = data_message.clone();
@@ -1665,136 +1650,9 @@ async fn save_message<S: Store>(
                     }
                 });
             }
-
-            // Note: The expire timer fields of data messages are only for contacts.
-            // Expire timers are handled for groups via upsert_group due to a revision change.
-            if let Thread::Contact(_) = thread {
-                let version = data_message.expire_timer_version.unwrap_or(1);
-                store
-                    .update_expire_timer(
-                        &thread,
-                        data_message.expire_timer.unwrap_or_default(),
-                        version,
-                    )
-                    .await?;
-            }
-
-            match data_message {
-                DataMessage {
-                    delete:
-                        Some(Delete {
-                            target_sent_timestamp: Some(ts),
-                        }),
-                    ..
-                } => {
-                    // replace an existing message by an empty NullMessage
-                    if let Some(mut existing_msg) = store.message(&thread, *ts).await? {
-                        existing_msg.metadata.sender = Aci::from(Uuid::nil()).into();
-                        existing_msg.body = NullMessage::default().into();
-                        store.save_message(&thread, existing_msg).await?;
-                        debug!(%thread, ts, "message in thread deleted");
-                        None
-                    } else {
-                        warn!(%thread, ts, "could not find message to delete in thread");
-                        None
-                    }
-                }
-                _ => Some(message),
-            }
         }
-        ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::DeleteForMe(ref delete)),
-            ..
-        }) => {
-            // TODO: Conversations, local-only deletes, attachments
-            for d in delete.message_deletes.iter().flat_map(|m| &m.messages) {
-                let sender = match &d.author {
-                    Some(Author::AuthorServiceId(id)) => {
-                        ServiceId::parse_from_service_id_string(id)
-                    }
-                    Some(Author::AuthorServiceIdBinary(id)) => {
-                        ServiceId::parse_from_service_id_binary(id)
-                    }
-                    Some(Author::AuthorE164(_)) => None,
-                    None => None,
-                };
-                let Some(sender) = sender else {
-                    tracing::warn!("Could not parse author of delete-for-self message; ignoring.");
-                    continue;
-                };
-                let Some(timestamp) = d.sent_timestamp else {
-                    tracing::warn!("Timestamp of delete-for-self message not given; ignoring.");
-                    continue;
-                };
-                let Ok(Some(thread)) = store
-                    .thread_for_sender_and_timestamp(&sender, timestamp)
-                    .await
-                else {
-                    tracing::warn!(
-                        "Message referenced by delete-for-self message not found; ignoring."
-                    );
-                    continue;
-                };
-                // Note: Not marking the message as deleted, like when receiving deletion requests by others.
-                // This matches the behavior of Signal Desktop, where the message completely disappears from the timeline.
-                let result = store.delete_message(&thread, timestamp).await;
-                if !result.is_ok_and(|d| d) {
-                    tracing::warn!(
-                        "Could not delete message referenced by delete-for-self message; ignoring."
-                    );
-                }
-            }
-            None
-        }
-        ContentBody::EditMessage(EditMessage {
-            target_sent_timestamp: Some(_),
-            data_message: Some(_),
-        })
-        | ContentBody::SynchronizeMessage(SyncMessage {
-            content:
-                Some(SyncContent::Sent(sync_message::Sent {
-                    edit_message:
-                        Some(EditMessage {
-                            target_sent_timestamp: Some(_),
-                            data_message: Some(_),
-                        }),
-                    ..
-                })),
-            ..
-        }) => Some(message),
-        // Call signaling is transient; calls are recorded by `CallEvent`s instead.
-        ContentBody::CallMessage(_) => None,
-        ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::CallEvent(_)),
-            ..
-        }) => Some(message),
-        ContentBody::SynchronizeMessage(msg) => {
-            debug!(
-                ?msg,
-                "skipping saving sync message without interesting fields"
-            );
-            None
-        }
-        ContentBody::ReceiptMessage(_) => Some(message),
-        ContentBody::TypingMessage(msg) => {
-            debug!(?msg, "skipping saving typing message");
-            None
-        }
-        ContentBody::StoryMessage(msg) => {
-            debug!(?msg, "skipping story message");
-            None
-        }
-        ContentBody::EditMessage(msg) => {
-            debug!(?msg, "invalid edited");
-            None
-        }
-    };
-
-    if let Some(message) = message {
-        store.save_message(&thread, message).await?;
     }
-
-    Ok(())
+    keep(store, message, Some(thread)).await
 }
 
 async fn upsert_contact_from_profile<S: Store>(
@@ -1804,48 +1662,40 @@ async fn upsert_contact_from_profile<S: Store>(
     sender: ServiceId,
     profile_key: ProfileKey,
 ) -> Result<(), Error<<S as Store>::Error>> {
-    if store.contact_by_id(&sender).await?.is_none()
-        || store
-            .profile_key(&sender)
-            .await?
-            .is_none_or(|p| p.bytes != profile_key.bytes)
-    {
-        if let Some(aci) = sender.aci() {
-            let sender_uuid: Uuid = aci.into();
-            let encrypted_profile = identified_websocket
-                .retrieve_profile_by_id(aci, Some(profile_key))
-                .await?;
-            let profile_cipher = ProfileCipher::new(profile_key);
-            let decrypted_profile = profile_cipher.decrypt(encrypted_profile)?;
+    if let Some(aci) = sender.aci() {
+        let sender_uuid: Uuid = aci.into();
+        let encrypted_profile = identified_websocket
+            .retrieve_profile_by_id(aci, Some(profile_key))
+            .await?;
+        let profile_cipher = ProfileCipher::new(profile_key);
+        let decrypted_profile = profile_cipher.decrypt(encrypted_profile)?;
 
-            let contact = Contact {
-                uuid: sender_uuid,
-                phone_number: None,
-                name: decrypted_profile
-                    .name
-                    // FIXME: this assumes [firstname] [lastname]
-                    .map(|pn| {
-                        if let Some(family_name) = pn.family_name {
-                            format!("{} {}", pn.given_name, family_name)
-                        } else {
-                            pn.given_name
-                        }
-                    })
-                    .unwrap_or_default(),
-                profile_key: profile_key.bytes.to_vec(),
-                expire_timer: data_message.expire_timer.unwrap_or_default(),
-                expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
-                inbox_position: 0,
-                avatar: None,
-                verified: Verified::default(),
-            };
+        let contact = Contact {
+            uuid: sender_uuid,
+            phone_number: None,
+            name: decrypted_profile
+                .name
+                // FIXME: this assumes [firstname] [lastname]
+                .map(|pn| {
+                    if let Some(family_name) = pn.family_name {
+                        format!("{} {}", pn.given_name, family_name)
+                    } else {
+                        pn.given_name
+                    }
+                })
+                .unwrap_or_default(),
+            profile_key: profile_key.bytes.to_vec(),
+            expire_timer: data_message.expire_timer.unwrap_or_default(),
+            expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+            inbox_position: 0,
+            avatar: None,
+            verified: Verified::default(),
+        };
 
-            info!(%sender_uuid, "saved contact on first sight");
-            store.save_contact(&contact).await?;
-            store.upsert_profile_key(&sender_uuid, profile_key).await?;
-        } else {
-            debug!("not storing profile for PNI contact");
-        }
+        info!(%sender_uuid, "saved contact on first sight");
+        store.save_contact(&contact).await?;
+    } else {
+        debug!("not storing profile for PNI contact");
     }
     Ok(())
 }

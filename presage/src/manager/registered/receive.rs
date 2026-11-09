@@ -28,6 +28,7 @@ use super::{
     download_sticker_pack, save_message, sync_groups_from_storage_service, upsert_group,
     MessageSender, Registered, RegistrationData, RegistrationType, ServiceCipher,
 };
+use crate::manager::Kept;
 use crate::model::messages::Received;
 use crate::store::Store;
 use crate::{Error, Manager};
@@ -441,18 +442,25 @@ impl<S: Store> Manager<S, Registered> {
                                         }
                                     }
 
-                                    if let Err(error) = save_message(
+                                    let kept = save_message(
                                         &mut state.store,
                                         &mut state.identified_websocket,
-                                        content.clone(),
+                                        &content,
                                         None,
                                     )
                                     .await
-                                    {
+                                    .unwrap_or_else(|error| {
                                         error!(%error, "error saving message to store");
-                                    }
+                                        Kept::NotStored
+                                    });
 
-                                    return Some((Received::Content(Box::new(content)), state));
+                                    return Some((
+                                        Received::Content {
+                                            content: Box::new(content),
+                                            kept,
+                                        },
+                                        state,
+                                    ));
                                 }
                                 Ok(None) => {
                                     debug!("empty envelope, message will be skipped!")

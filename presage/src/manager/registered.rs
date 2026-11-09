@@ -3604,21 +3604,28 @@ async fn save_message<S: Store>(
                     ..
                 } => {
                     let sent = message.metadata.client_timestamp.timestamp_millis() as u64;
-                    match store.message_sent_or_edited_at(&thread, *ts).await? {
+                    let sender = message.metadata.sender;
+                    match store
+                        .message_sent_or_edited_at(&thread, &sender, *ts)
+                        .await?
+                    {
                         // replace an existing message by an empty NullMessage
                         Some(mut existing_msg)
-                            if existing_msg.metadata.sender == message.metadata.sender
-                                && sent.saturating_sub(*ts) < DELETE_FOR_EVERYONE_WINDOW_MS =>
+                            if sent.saturating_sub(*ts) < DELETE_FOR_EVERYONE_WINDOW_MS =>
                         {
+                            let at = existing_msg.metadata.client_timestamp.timestamp_millis();
+                            store.delete_message(&thread, &sender, at as u64).await?;
                             existing_msg.metadata.sender = Aci::from(Uuid::nil()).into();
                             existing_msg.body = NullMessage::default().into();
                             store.save_message(&thread, existing_msg).await?;
                             debug!(%thread, ts, "message in thread deleted");
                         }
                         Some(_) => {
-                            warn!(%thread, ts, "ignoring delete of a message by someone else or too old");
+                            warn!(%thread, ts, "ignoring delete of a message too old");
                         }
-                        None => warn!(%thread, ts, "could not find message to delete in thread"),
+                        None => {
+                            warn!(%thread, ts, "could not find the sender's message to delete in thread")
+                        }
                     }
                     None
                 }
@@ -3660,7 +3667,7 @@ async fn save_message<S: Store>(
                 };
                 // Note: Not marking the message as deleted, like when receiving deletion requests by others.
                 // This matches the behavior of Signal Desktop, where the message completely disappears from the timeline.
-                let result = store.delete_message(&thread, timestamp).await;
+                let result = store.delete_message(&thread, &sender, timestamp).await;
                 if !result.is_ok_and(|d| d) {
                     tracing::warn!(
                         "Could not delete message referenced by delete-for-self message; ignoring."
@@ -3684,16 +3691,19 @@ async fn save_message<S: Store>(
                     ..
                 })),
             ..
-        }) => match store.message_sent_or_edited_at(&thread, target).await? {
+        }) => match store
+            .message_sent_or_edited_at(&thread, &message.metadata.sender, target)
+            .await?
+        {
             // An edit takes the place of the message it edits, which must be its sender's, and
             // names it by its first time, also when it came naming an earlier edit's.
-            Some(original) if original.metadata.sender == message.metadata.sender => {
+            Some(original) => {
                 let mut edit = message;
                 edit.metadata.client_timestamp = original.metadata.client_timestamp;
                 retarget_edit(&mut edit, original.timestamp());
                 Some(edit)
             }
-            _ => {
+            None => {
                 warn!(%thread, target, "ignoring edit of a message by someone else or not found");
                 None
             }
@@ -3727,25 +3737,28 @@ async fn save_message<S: Store>(
     };
 
     if let Some(message) = message {
-        // Messages are stored by thread and time, so a sender's message must not take the
-        // place of someone else's. A receipt gives way: one that went out or came in at the
-        // millisecond of a message must not keep that message out, nor take its place.
         let ts = message.metadata.client_timestamp.timestamp_millis() as u64;
-        let receipt = |content: &Content| matches!(content.body, ContentBody::ReceiptMessage(_));
-        match store.message(&thread, ts).await? {
-            Some(existing) if receipt(&message) && !receipt(&existing) => {
-                debug!(%thread, ts, "not saving a receipt in the place of a message");
-            }
-            Some(existing)
-                if existing.metadata.sender != message.metadata.sender && !receipt(&existing) =>
-            {
-                warn!(%thread, ts, "not saving a message in the place of someone else's");
+        match store.message(&thread, &message.metadata.sender, ts).await? {
+            Some(existing) if !replaces(&existing, &message) => {
+                debug!(%thread, ts, "not saving a message in the place of its sender's other one");
             }
             _ => store.save_message(&thread, message).await?,
         }
     }
 
     Ok(())
+}
+
+/// Whether `message` takes the place of `existing`, its sender's at the same time in a thread.
+/// A receipt doesn't take a message's place, nor keep it out. Of two messages one account's
+/// devices sent at one millisecond, the first stays: they have one name, and the first is the
+/// one already handed on. An edit takes its message's place from any of them.
+fn replaces(existing: &Content, message: &Content) -> bool {
+    let receipt = |content: &Content| matches!(content.body, ContentBody::ReceiptMessage(_));
+    receipt(existing)
+        || !receipt(message)
+            && (existing.metadata.sender_device == message.metadata.sender_device
+                || message.edited_at().is_some())
 }
 
 /// Points an edit at `original`, the first time of the message it edits.
@@ -3891,6 +3904,87 @@ fn story_access(
         key: vec![0; 16],
         certificate: sender_certificate.clone(),
     })
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use libsignal_service::{
+        content::{Content, ContentBody, Metadata},
+        prelude::Uuid,
+        proto::{receipt_message, DataMessage, EditMessage, ReceiptMessage},
+        protocol::{Aci, ServiceId},
+    };
+
+    use super::replaces;
+
+    fn from_device(device: u8, body: ContentBody) -> Content {
+        let sender = ServiceId::Aci(Aci::from(Uuid::from_u128(1)));
+        let at = chrono::DateTime::from_timestamp_millis(1_000).unwrap();
+        Content {
+            metadata: Metadata {
+                sender,
+                destination: sender,
+                sender_device: device.try_into().unwrap(),
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                server_guid: None,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body,
+        }
+    }
+
+    fn data(device: u8) -> Content {
+        from_device(
+            device,
+            ContentBody::DataMessage(DataMessage {
+                timestamp: Some(1_000),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn receipt(device: u8) -> Content {
+        from_device(
+            device,
+            ContentBody::ReceiptMessage(ReceiptMessage {
+                r#type: Some(receipt_message::Type::Read.into()),
+                timestamp: vec![500],
+            }),
+        )
+    }
+
+    fn edit(device: u8) -> Content {
+        from_device(
+            device,
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: Some(1_000),
+                data_message: Some(DataMessage {
+                    timestamp: Some(2_000),
+                    ..Default::default()
+                }),
+            }),
+        )
+    }
+
+    #[test]
+    fn the_first_of_one_accounts_messages_at_a_millisecond_stays() {
+        assert!(replaces(&data(1), &data(1)), "the same device's again");
+        assert!(!replaces(&data(1), &data(2)), "another device's");
+        assert!(replaces(&data(1), &edit(2)), "an edit, from any device");
+        assert!(replaces(&edit(1), &edit(2)), "a later edit");
+    }
+
+    #[test]
+    fn a_receipt_gives_way() {
+        assert!(!replaces(&data(1), &receipt(1)));
+        assert!(replaces(&receipt(1), &data(1)));
+        assert!(replaces(&receipt(1), &data(2)));
+        assert!(replaces(&receipt(1), &receipt(1)));
+    }
 }
 
 #[cfg(test)]

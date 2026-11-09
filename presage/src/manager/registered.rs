@@ -767,7 +767,6 @@ impl<S: Store> Manager<S, Registered> {
         message: impl Into<ContentBody>,
         timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
-        let mut sender = self.new_message_sender().await?;
         let recipient = recipient.into();
 
         let online_only = false;
@@ -789,7 +788,8 @@ impl<S: Store> Manager<S, Registered> {
             .map(|profile_key| UnidentifiedAccess {
                 key: profile_key.derive_access_key().to_vec(),
                 certificate: sender_certificate.clone(),
-            });
+            })
+            .or_else(|| story_access(&content_body, &sender_certificate));
 
         // we need to put our profile key in DataMessage
         if let ContentBody::DataMessage(message) = &mut content_body {
@@ -801,7 +801,9 @@ impl<S: Store> Manager<S, Registered> {
 
         ensure_data_message_timestamp(&mut content_body, timestamp);
 
-        sender
+        let mut sent = self
+            .new_message_sender()
+            .await?
             .send_message(
                 &recipient,
                 unidentified_access.as_ref(),
@@ -810,7 +812,23 @@ impl<S: Store> Manager<S, Registered> {
                 include_pni_signature,
                 online_only,
             )
-            .await?;
+            .await;
+        if sent.as_ref().is_err_and(websocket_closed) {
+            warn!("websocket closed while sending; retrying on a new connection");
+            sent = self
+                .new_message_sender()
+                .await?
+                .send_message(
+                    &recipient,
+                    unidentified_access.as_ref(),
+                    content_body.clone(),
+                    timestamp,
+                    include_pni_signature,
+                    online_only,
+                )
+                .await;
+        }
+        sent?;
 
         // save the message
         let content = Content {
@@ -956,8 +974,6 @@ impl<S: Store> Manager<S, Registered> {
         self.fetch_link_previews(&mut content_body).await;
         ensure_data_message_timestamp(&mut content_body, timestamp);
 
-        let mut sender = self.new_message_sender().await?;
-
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let Some(group) =
             upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &0).await?
@@ -972,14 +988,15 @@ impl<S: Store> Manager<S, Registered> {
             .into_iter()
             .filter(|m| m.aci != self.state.data.service_ids.aci())
         {
-            let unidentified_access =
-                self.store
-                    .profile_key(&member.aci.into())
-                    .await?
-                    .map(|profile_key| UnidentifiedAccess {
-                        key: profile_key.derive_access_key().to_vec(),
-                        certificate: sender_certificate.clone(),
-                    });
+            let unidentified_access = self
+                .store
+                .profile_key(&member.aci.into())
+                .await?
+                .map(|profile_key| UnidentifiedAccess {
+                    key: profile_key.derive_access_key().to_vec(),
+                    certificate: sender_certificate.clone(),
+                })
+                .or_else(|| story_access(&content_body, &sender_certificate));
             let include_pni_signature = false;
             recipients.push((
                 member.aci.into(),
@@ -989,7 +1006,8 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let online_only = false;
-        let results = match self
+        let mut sender = self.new_message_sender().await?;
+        let mut results = match self
             .send_with_sender_key(
                 &mut sender,
                 master_key_bytes,
@@ -1016,6 +1034,30 @@ impl<S: Store> Manager<S, Registered> {
                     .await
             }
         };
+        let again: Vec<_> = recipients
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| result.as_ref().is_err_and(websocket_closed))
+            .map(|(recipient, _)| recipient.clone())
+            .collect();
+        if !again.is_empty() {
+            warn!(
+                recipients = again.len(),
+                "websocket closed while sending to the group; retrying on a new connection"
+            );
+            let mut retried = self
+                .new_message_sender()
+                .await?
+                .send_message_to_group(&again, content_body.clone(), timestamp, online_only)
+                .await
+                .into_iter();
+            for result in results
+                .iter_mut()
+                .filter(|result| result.as_ref().is_err_and(websocket_closed))
+            {
+                *result = retried.next().expect("one result per retried recipient");
+            }
+        }
 
         // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
         results
@@ -1569,6 +1611,16 @@ impl From<TransferArchiveResponse> for TransferArchive {
 }
 
 /// Set the timestamp in any DataMessage so it matches its envelope's
+/// The websocket's task ended before the request went out; a new connection can carry it.
+fn websocket_closed(error: &MessageSenderError) -> bool {
+    matches!(
+        error,
+        MessageSenderError::ServiceError(
+            libsignal_service::push_service::ServiceError::WsClosing { .. }
+        )
+    )
+}
+
 fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64) {
     match content_body {
         ContentBody::DataMessage(message) => {
@@ -1866,6 +1918,19 @@ async fn upsert_contact_from_profile<S: Store>(
         debug!("not storing profile for PNI contact");
     }
     Ok(())
+}
+
+/// Sealed sender for a story to someone whose profile key isn't known: the server stores a story
+/// without its sender, so it must be sealed, and it checks no access key for one
+/// (Signal-Server `MessageController`), so any key will do.
+fn story_access(
+    content_body: &ContentBody,
+    sender_certificate: &SenderCertificate,
+) -> Option<UnidentifiedAccess> {
+    matches!(content_body, ContentBody::StoryMessage(_)).then(|| UnidentifiedAccess {
+        key: vec![0; 16],
+        certificate: sender_certificate.clone(),
+    })
 }
 
 #[cfg(test)]

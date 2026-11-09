@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::TimeZone;
 use futures::{future, AsyncReadExt};
 use libsignal_service::libsignal_account_keys::AccountEntropyPool;
+use libsignal_service::master_key::MasterKey;
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::provisioning::ProvisioningSecrets;
@@ -55,7 +56,7 @@ use url::Url;
 mod groups;
 mod receive;
 
-use self::groups::fetch_group;
+use self::groups::update_group;
 pub use self::groups::{GroupEdit, GroupJoin};
 
 use super::group_credentials::{GroupCredentialsCache, SharedGroupCredentials};
@@ -1417,10 +1418,13 @@ async fn sync_groups_from_storage_service<S: Store>(
 ) -> Result<(), Error<S::Error>> {
     const READ_CHUNK: usize = 100;
 
-    let master_key = store
-        .fetch_master_key()
-        .await?
-        .ok_or(Error::MissingKeyError("master_key".into()))?;
+    // The account entropy pool is the source of the master key: a linked device that got it in a
+    // key sync, and a primary, have it without a stored master key.
+    let master_key = match store.fetch_account_entropy_pool().await? {
+        Some(aep) => MasterKey::from_slice(aep.derive_svr_key().as_slice()).ok(),
+        None => store.fetch_master_key().await?,
+    }
+    .ok_or(Error::MissingKeyError("master_key".into()))?;
     let storage_key = StorageServiceKey::from_master_key(&master_key);
     let storage = StorageService::new(push_service, storage_key).await?;
 
@@ -1494,26 +1498,7 @@ async fn upsert_group<S: Store>(
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
-    let master_key: [u8; 32] = master_key_bytes.try_into()?;
-    let (upsert_group, avatar_path) = match store.group(master_key).await {
-        Ok(Some(group)) => {
-            debug!(group_name =% group.title, "loaded group from local db");
-            (group.revision < *revision, Some(group.avatar))
-        }
-        Ok(None) => (true, None),
-        Err(error) => {
-            warn!(%error, "failed to retrieve group from local db");
-            (true, None)
-        }
-    };
-
-    if upsert_group {
-        debug!("fetching and saving group");
-        if let Err(error) = fetch_group(store, groups_manager, master_key, avatar_path).await {
-            warn!(%error, "failed to fetch encrypted group");
-        }
-    }
-
+    update_group(store, groups_manager, master_key_bytes, *revision, None).await?;
     Ok(store.group(master_key_bytes.try_into()?).await?)
 }
 

@@ -1,12 +1,15 @@
+use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::TimeZone;
+use libsignal_service::push_service::HIGHEST_KNOWN_CHANGE_EPOCH;
 use libsignal_service::{
     content::{Content, ContentBody, Metadata},
     groups_v2::{decrypt_group, AccessRequired, GroupInviteLink, GroupJoinInfo, GroupsManager},
-    prelude::{MessageSenderError, Uuid},
+    prelude::{MessageSenderError, ProtobufMessage, Uuid},
     proto::{DataMessage, GroupContextV2},
     protocol::{Aci, ServiceId},
+    push_service::ServiceError,
     unidentified_access::UnidentifiedAccess,
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
@@ -19,6 +22,7 @@ use tracing::{debug, error, warn};
 use super::{ensure_data_message_timestamp, upsert_group, Registered};
 
 use crate::manager::group_credentials::GroupCredentialsCache;
+use crate::model::messages::MissedGroupChange;
 use crate::store::{Store, Thread};
 use crate::{model::groups::Group, Error, Manager};
 
@@ -174,7 +178,16 @@ impl<S: Store> Manager<S, Registered> {
             left.revision = revision;
             self.store.save_group(*master_key, left).await?;
         } else {
-            upsert_group(&self.store, &mut groups_manager, master_key, &revision).await?;
+            // The change the server signed is the next revision: no need to fetch the group.
+            let signed = signed.encode_to_vec();
+            update_group(
+                &self.store,
+                &mut groups_manager,
+                master_key,
+                revision,
+                Some(&signed),
+            )
+            .await?;
         }
         if let GroupEdit::Avatar(avatar) = &change {
             self.store.save_group_avatar(*master_key, avatar).await?;
@@ -617,6 +630,18 @@ impl<S: Store> Manager<S, Registered> {
             .ok_or(Error::UnknownGroup)
     }
 
+    /// Brings the stored group up to date from the server's log of its changes, as Signal's
+    /// apps do when its chat opens: what changed since the stored revision, if anything (a
+    /// request to join, say, which nobody tells the admins of). Returns those changes, oldest
+    /// first; fetches the group whole if none is stored or the log can't be read.
+    pub async fn update_group(
+        &mut self,
+        master_key: &[u8; 32],
+    ) -> Result<Vec<MissedGroupChange>, Error<S::Error>> {
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        update_group(&self.store, &mut groups_manager, master_key, u32::MAX, None).await
+    }
+
     fn now() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -696,6 +721,142 @@ impl<S: Store> Manager<S, Registered> {
         self.store
             .save_message(&Thread::Group(*master_key), content)
             .await?;
+        Ok(())
+    }
+}
+
+/// Brings the stored group up to `revision`, as Signal's apps do: by `change`, the change a
+/// message carries, if the server signed it and it is the next revision; else by the server's
+/// log of the changes since the stored revision; else, or with nothing stored, by fetching the
+/// group whole. Returns the changes read from the log, oldest first.
+pub(super) async fn update_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
+    master_key_bytes: &[u8],
+    revision: u32,
+    change: Option<&[u8]>,
+) -> Result<Vec<MissedGroupChange>, Error<S::Error>> {
+    let master_key: [u8; 32] = master_key_bytes.try_into()?;
+    let stored = match store.group(master_key).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            warn!(%error, "failed to retrieve group from local db");
+            None
+        }
+    };
+    let Some(mut group) = stored else {
+        fetch_group_whole(store, groups_manager, master_key, None).await;
+        return Ok(Vec::new());
+    };
+    debug!(group_name =% group.title, "loaded group from local db");
+    if group.revision >= revision {
+        return Ok(Vec::new());
+    }
+    let avatar = group.avatar.clone();
+    let signed = change.and_then(|change| {
+        let context = GroupContextV2 {
+            master_key: Some(master_key.to_vec()),
+            revision: Some(revision),
+            group_change: Some(change.to_vec()),
+        };
+        match groups_manager.decrypt_group_context(context) {
+            Ok(changes) => changes,
+            Err(error) => {
+                debug!(%error, "a group change that isn't the server's; not applied");
+                None
+            }
+        }
+    });
+    if let Some(changes) = signed {
+        if changes.change_epoch <= HIGHEST_KNOWN_CHANGE_EPOCH && group.apply(&changes) {
+            debug!(revision = group.revision, "applied the group's change");
+            save_group(store, groups_manager, master_key, group, Some(avatar)).await;
+            return Ok(Vec::new());
+        }
+    }
+    let read = groups_manager
+        .fetch_group_changes(&mut rand::rng(), &master_key, group.revision + 1, false)
+        .await;
+    match read {
+        Ok(entries) => {
+            debug!(
+                changes = entries.len(),
+                "read the group's changes from its log"
+            );
+            let latest = entries.iter().rev().find_map(|entry| entry.group.clone());
+            if let Some(latest) = latest {
+                save_group(
+                    store,
+                    groups_manager,
+                    master_key,
+                    latest.into(),
+                    Some(avatar),
+                )
+                .await;
+            }
+            Ok(entries
+                .into_iter()
+                .filter_map(|entry| {
+                    Some(MissedGroupChange {
+                        changes: entry.change?,
+                        signed: entry.signed_change?,
+                    })
+                })
+                .collect())
+        }
+        Err(error) => {
+            warn!(error = %Causes(&error), "failed to read the group's changes; fetching it whole");
+            fetch_group_whole(store, groups_manager, master_key, Some(avatar)).await;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// [`fetch_group`], once more if the connection failed: nothing fetches the group again until
+/// its next message, and until then it stays as it was (a member who left, still listed). Not
+/// if the server answered: a refusal (we aren't a member) would be the same again.
+async fn fetch_group_whole<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
+    master_key: [u8; 32],
+    avatar_path: Option<String>,
+) {
+    debug!("fetching and saving group");
+    let mut fetched = fetch_group(store, groups_manager, master_key, avatar_path.clone()).await;
+    if fetched
+        .as_ref()
+        .is_err_and(|error| matches!(error, Error::ServiceError(error) if transient(error)))
+    {
+        if let Err(error) = &fetched {
+            warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
+        }
+        fetched = fetch_group(store, groups_manager, master_key, avatar_path).await;
+    }
+    if let Err(error) = fetched {
+        warn!(error = %Causes(&error), "failed to fetch encrypted group");
+    }
+}
+
+/// Whether `error` is the connection's, not the server's answer: worth sending again.
+fn transient(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::Http(_) | ServiceError::Timeout { .. } | ServiceError::IO(_)
+    )
+}
+
+/// An error with its causes, each after a colon: reqwest's own message leaves them out ("error
+/// sending request for url" doesn't say that the connection closed under the request).
+struct Causes<'a>(&'a dyn std::error::Error);
+
+impl fmt::Display for Causes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            write!(f, ": {cause}")?;
+            source = cause.source();
+        }
         Ok(())
     }
 }
@@ -876,9 +1037,8 @@ pub enum GroupEdit {
     DenyRequest(Aci),
 }
 
-/// Fetches the group and stores it, refreshing the cached avatar if `avatar_path` (the stored
-/// one) is no longer the group's.
-pub(super) async fn fetch_group<S: Store>(
+/// Fetches the group and stores it, as [`save_group`] does.
+async fn fetch_group<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key: [u8; 32],
@@ -888,6 +1048,19 @@ pub(super) async fn fetch_group<S: Store>(
         .fetch_encrypted_group(&mut rand::rng(), &master_key)
         .await?;
     let group = decrypt_group(&master_key, encrypted_group)?;
+    save_group(store, groups_manager, master_key, group.into(), avatar_path).await;
+    Ok(())
+}
+
+/// Stores the group, refreshing the cached avatar if `avatar_path` (the stored one) is no
+/// longer the group's.
+async fn save_group<S: Store>(
+    store: &S,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
+    master_key: [u8; 32],
+    group: Group,
+    avatar_path: Option<String>,
+) {
     // A new picture, or none any more: the cached one is stale.
     if avatar_path.is_some_and(|path| path != group.avatar) {
         let avatar = if group.avatar.is_empty() {
@@ -910,7 +1083,6 @@ pub(super) async fn fetch_group<S: Store>(
     if let Err(error) = store.save_group(master_key, group).await {
         error!(%error, "failed to save group");
     }
-    Ok(())
 }
 
 /// How [`Manager::join_group`] went.
@@ -921,4 +1093,35 @@ pub enum GroupJoin {
     /// An administrator has to let us in. Meanwhile the group is stored with what the link
     /// shows of it, and us among its requesting members.
     Requested,
+}
+
+#[cfg(test)]
+mod causes_tests {
+    use super::Causes;
+
+    /// A broken connection is worth fetching again; a refusal isn't.
+    #[test]
+    fn only_a_failed_connection_is_fetched_again() {
+        use super::{transient, ServiceError};
+        assert!(transient(&ServiceError::Timeout { attempts: 1 }));
+        assert!(transient(&ServiceError::IO(std::io::Error::other("reset"))));
+        assert!(!transient(&ServiceError::Unauthorized));
+    }
+
+    /// The causes follow the error, as reqwest's own message leaves them out.
+    #[test]
+    fn an_error_is_logged_with_its_causes() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("error sending request for url")]
+        struct Sending(#[source] std::io::Error);
+
+        let error = Sending(std::io::Error::other(
+            "connection closed before message completed",
+        ));
+        assert_eq!(
+            Causes(&error).to_string(),
+            "error sending request for url: connection closed before message completed"
+        );
+        assert_eq!(Causes(&std::io::Error::other("alone")).to_string(), "alone");
+    }
 }

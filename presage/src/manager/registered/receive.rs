@@ -37,9 +37,10 @@ use libsignal_service::{
 use rand::rng;
 use tracing::{debug, error, info, trace, warn};
 
+use super::groups::update_group;
 use super::{
-    download_sticker_pack, save_message, sync_groups_from_storage_service, upsert_group,
-    MessageSender, Registered, RegistrationData, RegistrationType, ServiceCipher,
+    download_sticker_pack, save_message, sync_groups_from_storage_service, MessageSender,
+    Registered, RegistrationData, RegistrationType, ServiceCipher,
 };
 use crate::manager::group_credentials::GroupCredentialsCache;
 use crate::manager::Kept;
@@ -495,7 +496,7 @@ where
                 Some(GroupContextV2 {
                     master_key: Some(master_key_bytes),
                     revision: Some(revision),
-                    ..
+                    group_change,
                 }),
             ..
         })
@@ -508,7 +509,7 @@ where
                                 Some(GroupContextV2 {
                                     master_key: Some(master_key_bytes),
                                     revision: Some(revision),
-                                    ..
+                                    group_change,
                                 }),
                             ..
                         }),
@@ -517,15 +518,34 @@ where
             ..
         }) = &content.body
         {
-            if let Ok(Some(group)) = upsert_group(
+            match update_group(
                 &self.store,
                 &mut self.groups_manager,
                 master_key_bytes,
-                revision,
+                *revision,
+                group_change.as_deref(),
             )
             .await
             {
-                trace!(?group, "upserted group");
+                Ok(read) => {
+                    // The message tells of its own change.
+                    let missed: Vec<_> = read
+                        .into_iter()
+                        .filter(|changes| {
+                            group_change.is_none() || changes.changes.version != *revision
+                        })
+                        .collect();
+                    if let (false, Ok(master_key)) = (
+                        missed.is_empty(),
+                        <[u8; 32]>::try_from(master_key_bytes.as_slice()),
+                    ) {
+                        self.pending.push_back(Received::MissedGroupChanges {
+                            master_key,
+                            changes: missed,
+                        });
+                    }
+                }
+                Err(error) => warn!(%error, "failed to update the group"),
             }
         }
 

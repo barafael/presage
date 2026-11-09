@@ -112,7 +112,7 @@ impl Registered {
     }
 
     fn servers(&self) -> SignalServers {
-        self.data.signal_servers
+        self.data.signal_servers.clone()
     }
 
     fn service_configuration(&self) -> ServiceConfiguration {
@@ -679,7 +679,8 @@ impl<S: Store> Manager<S, Registered> {
             async move {
                 loop {
                     match state.encrypted_messages.next().await {
-                        Some(Ok(Incoming::Envelope(envelope))) => {
+                        Some(Ok(Incoming::Envelope { envelope, ack })) => {
+                            ack.ack();
                             let envelope = {
                                 // the permit is released at the end of the block (impl Drop)
                                 match envelope.parse_destination_service_id() {
@@ -1776,6 +1777,8 @@ impl<S: Store> Manager<S, Registered> {
                         .expect("Primary device to always have an account entropy pool"),
                     ephemeral_backup_key: None,
                     media_root_backup_key: None,
+                    // presage keeps no such setting: Signal's default.
+                    read_receipts: Some(true),
                 },
             )
             .await?;

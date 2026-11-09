@@ -92,7 +92,7 @@ impl<S: Store> Manager<S, Registration> {
         let password = Alphanumeric.sample_string(&mut rng, 24);
 
         let mut unidentified_push_service =
-            PushService::new(signal_servers, None, crate::USER_AGENT);
+            PushService::new(signal_servers.clone(), None, crate::USER_AGENT);
         let mut unidentified_websocket = unidentified_push_service
             .ws("/v1/websocket/", "/v1/keepalive", &[], None)
             .await?;

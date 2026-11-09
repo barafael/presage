@@ -12,7 +12,7 @@ use futures::StreamExt;
 use futures::{channel::oneshot, future, pin_mut};
 use mime_guess::mime::APPLICATION_OCTET_STREAM;
 use notify_rust::Notification;
-use presage::libsignal_service::configuration::SignalServers;
+use presage::libsignal_service::configuration::{ServiceConfiguration, SignalServers};
 use presage::libsignal_service::content::Reaction;
 use presage::libsignal_service::pre_keys::PreKeysStore;
 use presage::libsignal_service::prelude::phonenumber::PhoneNumber;
@@ -77,6 +77,9 @@ enum Cmd {
     Register {
         #[clap(long = "servers", short = 's', default_value = "staging")]
         servers: SignalServers,
+        /// A TOML file describing servers of your own, instead of `--servers`
+        #[clap(long = "servers-file", value_name = "PATH", conflicts_with = "servers")]
+        servers_file: Option<PathBuf>,
         #[clap(long, help = "Phone Number to register with in E.164 format")]
         phone_number: PhoneNumber,
         #[clap(long)]
@@ -94,6 +97,9 @@ enum Cmd {
         /// Possible values: staging, production
         #[clap(long, short = 's', default_value = "production")]
         servers: SignalServers,
+        /// A TOML file describing servers of your own, instead of `--servers`
+        #[clap(long = "servers-file", value_name = "PATH", conflicts_with = "servers")]
+        servers_file: Option<PathBuf>,
         #[clap(
             long,
             short = 'n',
@@ -624,10 +630,24 @@ async fn receive<S: Store>(
     Ok(())
 }
 
+/// The servers to use: Signal's, or the ones a TOML file describes (the serialized form of
+/// a [`ServiceConfiguration`]).
+fn servers_from(servers: SignalServers, file: Option<PathBuf>) -> anyhow::Result<SignalServers> {
+    let Some(path) = file else {
+        return Ok(servers);
+    };
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let configuration: ServiceConfiguration =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(SignalServers::Custom(Box::new(configuration)))
+}
+
 async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
     match subcommand {
         Cmd::Register {
             servers,
+            servers_file,
             phone_number,
             use_voice_call,
             captcha,
@@ -636,7 +656,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let manager = Manager::register(
                 store,
                 RegistrationOptions {
-                    signal_servers: servers,
+                    signal_servers: servers_from(servers, servers_file)?,
                     phone_number,
                     use_voice_call,
                     captcha: Some(captcha.host_str().unwrap()),
@@ -660,8 +680,10 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         }
         Cmd::LinkDevice {
             servers,
+            servers_file,
             device_name,
         } => {
+            let servers = servers_from(servers, servers_file)?;
             let (provisioning_link_tx, provisioning_link_rx) = oneshot::channel();
             let manager = future::join(
                 Manager::link_secondary_device(

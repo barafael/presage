@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT distribution_id, created_at FROM group_sender_keys WHERE master_key = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "distribution_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "group_sender_keys",
+            "name": "distribution_id"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "group_sender_keys",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "d581c01e4c4b7af8c4041e6fdf211e6b36d5aee679480080bda1ee45789430f7"
+}

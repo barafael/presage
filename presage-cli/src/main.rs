@@ -621,8 +621,24 @@ async fn receive<S: Store>(
                 )
                 .await
             }
-            Received::DecryptionError(c) => {
-                println!("failed to receive a message from a contact: {c:?}")
+            Received::DecryptionError {
+                sender,
+                sender_device,
+                timestamp,
+                error,
+            } => {
+                println!("failed to decrypt a message from {sender:?}.{sender_device} of {timestamp}: {error}")
+            }
+            Received::RetryReceipt {
+                sender, message, ..
+            } => {
+                println!(
+                    "{sender:?} failed to decrypt our message of {:?}",
+                    message.timestamp
+                )
+            }
+            Received::StickerPackInstalled { pack_id } => {
+                println!("installed sticker pack {}", hex::encode(pack_id))
             }
         }
     }
@@ -979,9 +995,13 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     Received::QueueEmpty => break,
                     Received::Contacts => println!("got contacts! thank you, come again."),
                     Received::Content { .. } => print!("."),
-                    Received::DecryptionError(_) => {
-                        println!("failed to receive a message from a contact")
+                    Received::DecryptionError { .. } => {
+                        println!("failed to decrypt a message from a contact")
                     }
+                    Received::RetryReceipt { .. } => {
+                        println!("a contact failed to decrypt a message of ours")
+                    }
+                    Received::StickerPackInstalled { .. } => {}
                 }
             }
         }

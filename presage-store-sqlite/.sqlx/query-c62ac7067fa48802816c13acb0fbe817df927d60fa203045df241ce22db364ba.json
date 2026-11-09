@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT service_id, device_id, registration_id FROM sender_key_shared\n                WHERE distribution_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "service_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sender_key_shared",
+            "name": "service_id"
+          }
+        }
+      },
+      {
+        "name": "device_id",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "sender_key_shared",
+            "name": "device_id"
+          }
+        }
+      },
+      {
+        "name": "registration_id",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "sender_key_shared",
+            "name": "registration_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c62ac7067fa48802816c13acb0fbe817df927d60fa203045df241ce22db364ba"
+}

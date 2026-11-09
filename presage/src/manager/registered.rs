@@ -902,9 +902,33 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let online_only = false;
-        let results = sender
-            .send_message_to_group(recipients, content_body.clone(), timestamp, online_only)
-            .await;
+        let results = match self
+            .send_with_sender_key(
+                &mut sender,
+                master_key_bytes,
+                &recipients,
+                &content_body,
+                timestamp,
+            )
+            .await
+        {
+            Some(results) => {
+                sender
+                    .sync_group_send(&content_body, timestamp, &results, false)
+                    .await;
+                results
+            }
+            None => {
+                sender
+                    .send_message_to_group(
+                        &recipients,
+                        content_body.clone(),
+                        timestamp,
+                        online_only,
+                    )
+                    .await
+            }
+        };
 
         // TODO: Handle the NotFound error in the future by removing all sessions to this UUID and marking it as unregistered, not sending any messages to this contact anymore.
         results

@@ -26,7 +26,10 @@ use tracing::trace;
 
 use crate::{
     manager::RegistrationData,
-    model::{contacts::Contact, groups::Group},
+    model::{
+        contacts::Contact,
+        groups::{Group, GroupSenderKey, SharedDevice},
+    },
     AvatarBytes,
 };
 
@@ -327,6 +330,34 @@ pub trait ContentsStore: Send + Sync {
         &self,
         master_key: GroupMasterKeyBytes,
     ) -> impl Future<Output = Result<bool, Self::ContentsStoreError>>;
+
+    /// The sender key the group's messages go with, if one was made.
+    fn group_sender_key(
+        &self,
+        master_key: GroupMasterKeyBytes,
+    ) -> impl Future<Output = Result<Option<GroupSenderKey>, Self::ContentsStoreError>>;
+
+    /// Sets the sender key the group's messages go with: whoever had the one before has
+    /// nothing of this one.
+    fn save_group_sender_key(
+        &self,
+        master_key: GroupMasterKeyBytes,
+        key: GroupSenderKey,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
+
+    /// The devices our sender key `distribution_id` was sent to.
+    fn sender_key_shared(
+        &self,
+        distribution_id: Uuid,
+    ) -> impl Future<Output = Result<Vec<SharedDevice>, Self::ContentsStoreError>>;
+
+    /// Notes that `devices` have our sender key `distribution_id` now, in place of what was noted
+    /// for them before.
+    fn share_sender_key(
+        &self,
+        distribution_id: Uuid,
+        devices: &[SharedDevice],
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     /// Save a group avatar in the cache
     fn save_group_avatar(

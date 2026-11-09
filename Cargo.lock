@@ -3397,6 +3397,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "futures",
  "libsqlite3-sys",
  "presage",
  "prost",

@@ -1,4 +1,8 @@
-use libsignal_service::{prelude::Content, protocol::ServiceId};
+use libsignal_service::{
+    prelude::Content,
+    proto::DecryptionErrorMessage,
+    protocol::{DeviceId, ServiceId, SignalProtocolError},
+};
 
 use crate::manager::Kept;
 
@@ -12,13 +16,29 @@ pub enum Received {
     /// Contacts can be later queried in the store.
     Contacts,
 
-    // Failed to receive a message from the specified service ID.
-    // A session reset with the contact may fix this.
-    DecryptionError(ServiceId),
+    /// Failed to decrypt a message from the specified service ID; `error` says why.
+    /// A session reset with the contact may fix this, unless the error is
+    /// [`SignalProtocolError::DuplicatedMessage`]: a message delivered again, already handled.
+    /// `sender_device` and `timestamp` (the envelope's) name the message, as a retry receipt does.
+    DecryptionError {
+        sender: ServiceId,
+        sender_device: DeviceId,
+        timestamp: u64,
+        error: SignalProtocolError,
+    },
+
+    /// One of the sender's devices failed to decrypt a message of ours: a retry receipt, which
+    /// names the message by its timestamp. Signal's clients resend it to that device.
+    RetryReceipt {
+        sender: ServiceId,
+        sender_device: DeviceId,
+        message: DecryptionErrorMessage,
+    },
 
     /// Incoming decrypted message with metadata and content, and what was kept of it.
-    Content {
-        content: Box<Content>,
-        kept: Kept,
-    },
+    Content { content: Box<Content>, kept: Kept },
+
+    /// A sticker pack installed on another device (announced in a sync message, which comes as
+    /// [`Received::Content`] first) has been downloaded and stored: it can be listed now.
+    StickerPackInstalled { pack_id: Vec<u8> },
 }

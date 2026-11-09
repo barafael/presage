@@ -14,7 +14,7 @@ use libsignal_service::{
     cipher,
     configuration::{ServiceConfiguration, SignalServers},
     content::{Content, ContentBody, Metadata},
-    groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
+    groups_v2::{decrypt_group, GroupsManager},
     messagepipe::ServiceCredentials,
     prelude::{phonenumber::PhoneNumber, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
@@ -52,8 +52,13 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+mod groups;
 mod receive;
 
+use self::groups::fetch_group;
+pub use self::groups::{GroupEdit, GroupJoin};
+
+use super::group_credentials::{GroupCredentialsCache, SharedGroupCredentials};
 use super::keep::{keep, Kept};
 use super::settings::{Settings, SharedSettings};
 use crate::model::contacts::Contact;
@@ -87,6 +92,9 @@ pub struct Registered {
     /// Shared by every cipher and sender of this account, and by its clones.
     pub(crate) session_lock: SessionLock,
 
+    /// The account's group credentials, which every groups manager made shares.
+    pub(crate) group_credentials: SharedGroupCredentials,
+
     pub(crate) data: Arc<RegistrationData>,
 }
 
@@ -107,6 +115,7 @@ impl Registered {
             link_preview_client: Default::default(),
             settings: Default::default(),
             session_lock: Default::default(),
+            group_credentials: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -501,8 +510,7 @@ impl<S: Store> Manager<S, Registered> {
             .try_into()
             .expect("Master key bytes to be of size 32.");
 
-        // Check if group avatar is cached.
-        // TODO: Is there some way to know if this is outdated?
+        // Cached, and kept current by `upsert_group`; empty means the group has none.
         if let Some(avatar) = self
             .store
             .group_avatar(master_key_bytes)
@@ -510,7 +518,7 @@ impl<S: Store> Manager<S, Registered> {
             .ok()
             .flatten()
         {
-            return Ok(Some(avatar));
+            return Ok(Some(avatar).filter(|avatar| !avatar.is_empty()));
         }
 
         let mut gm = Box::pin(self.groups_manager()).await?;
@@ -590,11 +598,11 @@ impl<S: Store> Manager<S, Registered> {
 
     async fn groups_manager(
         &self,
-    ) -> Result<GroupsManager<InMemoryCredentialsCache>, Error<S::Error>> {
+    ) -> Result<GroupsManager<GroupCredentialsCache>, Error<S::Error>> {
         let service_configuration = self.state.service_configuration();
         let server_public_params = service_configuration.zkgroup_server_public_params;
 
-        let groups_credentials_cache = InMemoryCredentialsCache::default();
+        let groups_credentials_cache = self.state.group_credentials.cache();
         let groups_manager = GroupsManager::new(
             self.state.data.service_ids.clone(),
             self.identified_push_service(),
@@ -1405,7 +1413,7 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
 async fn sync_groups_from_storage_service<S: Store>(
     store: &S,
     push_service: PushService,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
 ) -> Result<(), Error<S::Error>> {
     const READ_CHUNK: usize = 100;
 
@@ -1455,7 +1463,7 @@ async fn sync_groups_from_storage_service<S: Store>(
 /// Incoming messages keep known groups current, so only unknown ones are fetched.
 async fn save_unknown_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key_bytes: &[u8],
 ) -> Result<(), Error<S::Error>> {
     let master_key: GroupMasterKeyBytes = master_key_bytes.try_into()?;
@@ -1482,37 +1490,27 @@ async fn save_unknown_group<S: Store>(
 
 async fn upsert_group<S: Store>(
     store: &S,
-    groups_manager: &mut GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
-    let upsert_group = match store.group(master_key_bytes.try_into()?).await {
+    let master_key: [u8; 32] = master_key_bytes.try_into()?;
+    let (upsert_group, avatar_path) = match store.group(master_key).await {
         Ok(Some(group)) => {
             debug!(group_name =% group.title, "loaded group from local db");
-            group.revision < *revision
+            (group.revision < *revision, Some(group.avatar))
         }
-        Ok(None) => true,
+        Ok(None) => (true, None),
         Err(error) => {
             warn!(%error, "failed to retrieve group from local db");
-            true
+            (true, None)
         }
     };
 
     if upsert_group {
         debug!("fetching and saving group");
-        match groups_manager
-            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
-            .await
-        {
-            Ok(encrypted_group) => {
-                let group = decrypt_group(master_key_bytes, encrypted_group)?;
-                if let Err(error) = store.save_group(master_key_bytes.try_into()?, group).await {
-                    error!(%error, "failed to save group");
-                }
-            }
-            Err(error) => {
-                warn!(%error, "failed to fetch encrypted group")
-            }
+        if let Err(error) = fetch_group(store, groups_manager, master_key, avatar_path).await {
+            warn!(%error, "failed to fetch encrypted group");
         }
     }
 

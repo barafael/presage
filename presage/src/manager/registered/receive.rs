@@ -18,7 +18,7 @@ use libsignal_service::session_lock::SessionLock;
 use libsignal_service::{
     content::ContentBody,
     encrypt_device_name,
-    groups_v2::{GroupsManager, InMemoryCredentialsCache},
+    groups_v2::GroupsManager,
     messagepipe::{Incoming, MessagePipe},
     proto::{
         sync_message::{self, sticker_pack_operation, Content as SyncContent},
@@ -41,6 +41,7 @@ use super::{
     download_sticker_pack, save_message, sync_groups_from_storage_service, upsert_group,
     MessageSender, Registered, RegistrationData, RegistrationType, ServiceCipher,
 };
+use crate::manager::group_credentials::GroupCredentialsCache;
 use crate::manager::Kept;
 use crate::model::messages::Received;
 use crate::store::Store;
@@ -157,7 +158,7 @@ struct Receiver<S: Store, E> {
     trust_roots: Vec<PublicKey>,
     aci_address: ProtocolAddress,
     pni_address: ProtocolAddress,
-    groups_manager: GroupsManager<InMemoryCredentialsCache>,
+    groups_manager: GroupsManager<GroupCredentialsCache>,
     identified_push_service: PushService,
     service_ids: ServiceIds,
     message_sender: MessageSender<S::AciStore>,

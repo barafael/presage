@@ -59,6 +59,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+use super::settings::{Settings, SharedSettings};
 use crate::model::contacts::Contact;
 use crate::model::previews;
 use crate::serde::serde_profile_key;
@@ -88,6 +89,7 @@ pub struct Registered {
     pub(crate) unidentified_websocket: Arc<Mutex<Option<SignalWebSocket<websocket::Unidentified>>>>,
     pub(crate) unidentified_sender_certificate: Arc<Mutex<Option<SenderCertificate>>>,
     pub(crate) link_preview_client: OnceLock<reqwest::Client>,
+    pub(crate) settings: SharedSettings,
 
     pub(crate) data: Arc<RegistrationData>,
 }
@@ -107,6 +109,7 @@ impl Registered {
             unidentified_websocket: Default::default(),
             unidentified_sender_certificate: Default::default(),
             link_preview_client: Default::default(),
+            settings: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -185,6 +188,17 @@ impl RegistrationData {
     }
 }
 
+impl<S> Manager<S, Registered> {
+    pub fn settings(&self) -> Settings {
+        self.state.settings.get()
+    }
+
+    /// Changes the settings of this manager and its clones.
+    pub fn set_settings(&self, settings: Settings) {
+        self.state.settings.set(settings);
+    }
+}
+
 impl<S: Store> Manager<S, Registered> {
     /// Loads a previously registered account from the implemented [Store].
     ///
@@ -253,7 +267,11 @@ impl<S: Store> Manager<S, Registered> {
         {
             Some(ws) => Ok(ws.clone()),
             None => {
-                let headers = &[("X-Signal-Receive-Stories", "false")];
+                let receive_stories = self.state.settings.get().receive_stories;
+                let headers = &[(
+                    "X-Signal-Receive-Stories",
+                    if receive_stories { "true" } else { "false" },
+                )];
                 let ws = self
                     .identified_push_service()
                     .ws(
@@ -1250,15 +1268,14 @@ impl<S: Store> Manager<S, Registered> {
         }))
     }
 
-    /// Sets a preview of the first link of a data message that has no preview yet.
+    /// Sets a preview of the first link of a data message that has no preview yet, if
+    /// [`Settings::automatic_link_previews`] are on.
     async fn fetch_link_previews(&self, content_body: &mut ContentBody) {
         let ContentBody::DataMessage(message) = content_body else {
             return;
         };
-        if !message.preview.is_empty() {
-            return;
-        }
-        let Some(body) = message.body.as_deref() else {
+        let settings = self.state.settings.get();
+        let Some(body) = settings.automatic_link_preview_body(message) else {
             return;
         };
         match self.link_preview(body).await {

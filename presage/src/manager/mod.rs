@@ -4,6 +4,7 @@ mod confirmation;
 mod linking;
 mod registered;
 mod registration;
+mod settings;
 
 use std::fmt;
 
@@ -11,6 +12,7 @@ pub use self::confirmation::Confirmation;
 pub use self::linking::Linking;
 pub use self::registered::{Registered, RegistrationData, RegistrationType};
 pub use self::registration::{Registration, RegistrationOptions};
+pub use self::settings::Settings;
 
 /// Signal manager
 ///

@@ -61,6 +61,9 @@ impl<S: Store> Manager<S, Registered> {
         let asked = wanted.clone();
         std::thread::Builder::new()
             .name("presage-receive".into())
+            // The session and group futures are large and all live on this stack; a first
+            // message from a new device overflows the 2 MiB default in a debug build.
+            .stack_size(RECEIVE_STACK)
             .spawn(move || {
                 // The protocol stores' futures aren't `Send`: they stay on this thread.
                 let local = tokio::task::LocalSet::new();
@@ -76,6 +79,9 @@ impl<S: Store> Manager<S, Registered> {
         })
     }
 }
+
+/// The receiving thread's stack; only what is touched is ever committed.
+const RECEIVE_STACK: usize = 64 * 1024 * 1024;
 
 /// What [`Manager::receive_messages`] receives, until dropped.
 #[derive(Debug)]

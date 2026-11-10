@@ -62,12 +62,15 @@ pub struct QueuedJob {
     pub due_at: u64,
 }
 
-/// How long after failing `attempts` times a job waits, or `None` once it is given up.
-pub fn backoff(attempts: u32) -> Option<std::time::Duration> {
-    const WAITS_SECS: [u64; 6] = [5, 30, 120, 600, 3600, 6 * 3600];
-    WAITS_SECS
-        .get(attempts.checked_sub(1)? as usize)
-        .map(|secs| std::time::Duration::from_secs(*secs))
+const WAITS_SECS: [u64; 6] = [5, 30, 120, 600, 3600, 6 * 3600];
+
+/// How long after failing `attempts` times a job waits, or `None` once it is given up. A
+/// failure of the connection (`connection_failed`) says nothing against the job: it waits, the
+/// longest wait at most, and isn't given up.
+pub fn backoff(attempts: u32, connection_failed: bool) -> Option<std::time::Duration> {
+    let wait = WAITS_SECS.get(attempts.checked_sub(1)? as usize).copied();
+    wait.or(connection_failed.then_some(WAITS_SECS[WAITS_SECS.len() - 1]))
+        .map(std::time::Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -88,8 +91,14 @@ mod tests {
 
     #[test]
     fn a_job_waits_longer_each_time_and_is_given_up() {
-        assert!(backoff(1).unwrap() < backoff(2).unwrap());
-        assert!(backoff(6).is_some());
-        assert!(backoff(7).is_none());
+        assert!(backoff(1, false).unwrap() < backoff(2, false).unwrap());
+        assert!(backoff(6, false).is_some());
+        assert!(backoff(7, false).is_none());
+    }
+
+    #[test]
+    fn a_job_the_connection_failed_is_not_given_up() {
+        assert_eq!(backoff(1, true), backoff(1, false));
+        assert_eq!(backoff(70, true), backoff(6, false));
     }
 }

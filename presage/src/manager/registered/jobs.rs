@@ -224,7 +224,8 @@ fn now() -> u64 {
 
 /// Runs the queued jobs until dropped: each when it is due, all of them once at the start (the
 /// connection is new, whatever made them fail may be gone). A job that fails waits
-/// ([`backoff`]) and is given up after its last wait. What a job brings is told to `told`.
+/// ([`backoff`]) and is given up after its last wait, unless it was the connection that failed.
+/// What a job brings is told to `told`.
 pub(super) async fn run<S: Store>(
     manager: Manager<S, Registered>,
     told: mpsc::UnboundedSender<Received>,
@@ -298,6 +299,34 @@ pub(super) async fn run<S: Store>(
     }
 }
 
+/// Whether `error` is the connection's and not the server's answer: no reason to give a job up.
+fn connection_failed<E: std::error::Error>(error: &Error<E>) -> bool {
+    use libsignal_service::prelude::{MessageSenderError, ServiceError};
+    use libsignal_service::{ProfileManagerError, StorageServiceError};
+
+    let service = |error: &ServiceError| {
+        matches!(
+            error,
+            ServiceError::Http(_)
+                | ServiceError::Timeout { .. }
+                | ServiceError::IO(_)
+                | ServiceError::WebSocket(_)
+                | ServiceError::WsClosing { .. }
+                | ServiceError::RateLimitExceeded { .. }
+        )
+    };
+    match error {
+        Error::ServiceError(error)
+        | Error::ProfileManagerError(ProfileManagerError::ServiceError(error))
+        | Error::StorageServiceError(StorageServiceError::Service(error)) => service(error),
+        Error::MessageSenderError(error) => {
+            matches!(&**error, MessageSenderError::ServiceError(error) if service(error))
+        }
+        Error::Timeout(_) => true,
+        _ => false,
+    }
+}
+
 async fn settle<S: Store>(
     store: &mut S,
     told: &mpsc::UnboundedSender<Received>,
@@ -313,7 +342,7 @@ async fn settle<S: Store>(
             }
             store.finish_job(&job).await
         }
-        Err(error) => match backoff(job.attempts + 1) {
+        Err(error) => match backoff(job.attempts + 1, connection_failed(&error)) {
             Some(wait) => {
                 warn!(%error, job = ?job.job, ?wait, "job failed; trying again later");
                 store.retry_job(&job, now() + wait.as_millis() as u64).await

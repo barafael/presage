@@ -5,7 +5,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::TimeZone;
 use futures::{future, AsyncReadExt};
 use libsignal_service::libsignal_account_keys::AccountEntropyPool;
-use libsignal_service::master_key::MasterKey;
 use libsignal_service::prelude::SessionStoreExt;
 use libsignal_service::protocol::{ProtocolAddress, SessionStore};
 use libsignal_service::provisioning::ProvisioningSecrets;
@@ -59,6 +58,7 @@ mod receive;
 use self::groups::update_group;
 pub use self::groups::{GroupEdit, GroupJoin};
 
+use super::account_keys::AccountKeys;
 use super::group_credentials::{GroupCredentialsCache, SharedGroupCredentials};
 use super::keep::{keep, Kept};
 use super::settings::{Settings, SharedSettings};
@@ -153,6 +153,15 @@ impl Registered {
             device_id: self.data.device_id.and_then(|d| d.try_into().ok()),
         }
     }
+}
+
+/// See [`Manager::services`].
+#[derive(Clone)]
+pub struct Services {
+    pub identified_push_service: PushService,
+    pub unidentified_push_service: PushService,
+    pub identified_websocket: SignalWebSocket<websocket::Identified>,
+    pub unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
 }
 
 /// Registration data like device name, and credentials to connect to Signal
@@ -253,6 +262,17 @@ impl<S: Store> Manager<S, Registered> {
     /// doesn't make itself, such as asking for a sticker pack's upload forms.
     pub fn identified_push_service(&self) -> PushService {
         self.state.identified_push_service()
+    }
+
+    /// The connections this manager uses itself, for what presage doesn't do: requests of the
+    /// client's own go through them as presage's do, with its credentials and client identity.
+    pub async fn services(&self) -> Result<Services, Error<S::Error>> {
+        Ok(Services {
+            identified_push_service: self.identified_push_service(),
+            unidentified_push_service: self.unidentified_push_service(),
+            identified_websocket: self.identified_websocket(false).await?,
+            unidentified_websocket: self.unidentified_websocket().await?,
+        })
     }
 
     /// Returns a clone of a cached push service (without credentials).
@@ -385,42 +405,31 @@ impl<S: Store> Manager<S, Registered> {
             .expect("logic error"))
     }
 
-    /// For editing records without decoding them. `None` as for [`Self::storage_service`].
-    pub async fn storage_access(
-        &self,
-    ) -> Result<
-        Option<(
-            libsignal_service::push_service::PushService,
-            libsignal_service::master_key::StorageServiceKey,
-        )>,
-        Error<S::Error>,
-    > {
-        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
-        let Some(pool) = self.account_entropy_pool().await? else {
-            return Ok(None);
-        };
-        let master_key =
-            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
-        Ok(Some((
-            self.identified_push_service(),
-            StorageServiceKey::from_master_key(&master_key),
-        )))
+    /// The account's keys, as far as this device has them: `None` on a linked device until
+    /// the primary has sent the account entropy pool.
+    pub async fn account_keys(&self) -> Result<Option<AccountKeys>, Error<S::Error>> {
+        // A primary makes its pool when first asked.
+        self.account_entropy_pool().await?;
+        Ok(AccountKeys::load(&self.store).await?)
     }
 
-    /// `None` until the primary device has sent the account entropy pool.
-    pub async fn storage_service(
+    /// For editing records without decoding them. `None` as for [`Self::account_keys`].
+    pub async fn storage_access(
         &self,
-    ) -> Result<Option<libsignal_service::StorageService>, Error<S::Error>> {
-        let Some(pool) = self.account_entropy_pool().await? else {
+    ) -> Result<Option<(PushService, StorageServiceKey)>, Error<S::Error>> {
+        Ok(self
+            .account_keys()
+            .await?
+            .map(|keys| (self.identified_push_service(), keys.storage_key())))
+    }
+
+    /// `None` as for [`Self::account_keys`].
+    pub async fn storage_service(&self) -> Result<Option<StorageService>, Error<S::Error>> {
+        let Some(keys) = self.account_keys().await? else {
             return Ok(None);
         };
-        use libsignal_service::master_key::{MasterKey, StorageServiceKey};
-        // The SVR key is the account's master key.
-        let master_key =
-            MasterKey::from_slice(&pool.derive_svr_key()).expect("master keys have 32 bytes");
-        let key = StorageServiceKey::from_master_key(&master_key);
         let service =
-            libsignal_service::StorageService::new(self.identified_push_service(), key).await?;
+            StorageService::new(self.identified_push_service(), keys.storage_key()).await?;
         Ok(Some(service))
     }
 
@@ -1646,15 +1655,10 @@ async fn sync_groups_from_storage_service<S: Store>(
 ) -> Result<(), Error<S::Error>> {
     const READ_CHUNK: usize = 100;
 
-    // The account entropy pool is the source of the master key: a linked device that got it in a
-    // key sync, and a primary, have it without a stored master key.
-    let master_key = match store.fetch_account_entropy_pool().await? {
-        Some(aep) => MasterKey::from_slice(aep.derive_svr_key().as_slice()).ok(),
-        None => store.fetch_master_key().await?,
-    }
-    .ok_or(Error::MissingKeyError("master_key".into()))?;
-    let storage_key = StorageServiceKey::from_master_key(&master_key);
-    let storage = StorageService::new(push_service, storage_key).await?;
+    let keys = AccountKeys::load(store)
+        .await?
+        .ok_or(Error::MissingKeyError("master_key".into()))?;
+    let storage = StorageService::new(push_service, keys.storage_key()).await?;
 
     let manifest = storage.manifest().await?;
     let group_ids: Vec<Vec<u8>> = manifest

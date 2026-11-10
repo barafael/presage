@@ -6,10 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc;
 use futures::future::{self, Either};
-use futures::stream::FuturesUnordered;
-use futures::{pin_mut, FutureExt, StreamExt};
+use futures::{pin_mut, StreamExt};
 use libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use libsignal_service::prelude::{ProtobufMessage, Uuid};
+use libsignal_service::profile_cipher::ProfileCipher;
 use libsignal_service::proto::sync_message::{self, Content as SyncContent, StickerPackOperation};
 use libsignal_service::proto::{contact_details, SyncMessage};
 use libsignal_service::protocol::{Aci, ServiceId};
@@ -25,8 +25,8 @@ use crate::model::messages::Received;
 use crate::store::Store;
 use crate::{Error, Manager};
 
-/// How many jobs run at once.
-const CONCURRENT: usize = 4;
+/// How many jobs run at once: each may hold one of the store's few connections.
+const CONCURRENT: usize = 2;
 
 impl<S: Store> Manager<S, Registered> {
     async fn run_job(mut self, job: &Job) -> Result<Vec<Received>, Error<S::Error>> {
@@ -44,19 +44,13 @@ impl<S: Store> Manager<S, Registered> {
                 if current.is_some_and(|current| current.bytes != profile_key.bytes) {
                     return Ok(Vec::new());
                 }
-                // With the profile as stored when fetching it failed midway (its picture) or
-                // altogether: the contact is saved by the name known, and the profile, still not
-                // current, is fetched again with their next message.
-                let profile = match self.refresh_profile(aci, profile_key).await {
-                    Ok(profile) => profile,
-                    Err(error) => match self.store.profile(aci.into(), profile_key).await? {
-                        Some(profile) => {
-                            warn!(%error, "failed to fetch a profile; saving the contact as known");
-                            profile
-                        }
-                        None => return Err(error),
-                    },
-                };
+                // Their name only: the stored profile is fetched when it is asked for.
+                let profile = self
+                    .identified_websocket(false)
+                    .await?
+                    .retrieve_profile_by_id(aci, Some(profile_key))
+                    .await?;
+                let profile = ProfileCipher::new(profile_key).decrypt(profile)?;
                 save_contact_from_profile(
                     &mut self.store,
                     aci,
@@ -238,13 +232,16 @@ fn now() -> u64 {
 /// connection is new, whatever made them fail may be gone). A job that fails waits
 /// ([`backoff`]) and is given up after its last wait, unless it was the connection that failed.
 /// What a job brings is told to `told`.
+///
+/// Each job is a task of its own: one that holds the store's write lock must go on while this
+/// loop waits for the store itself.
 pub(super) async fn run<S: Store>(
     manager: Manager<S, Registered>,
     told: mpsc::UnboundedSender<Received>,
 ) {
     let wake = manager.state.jobs_wake.clone();
-    let mut store = manager.store.clone();
-    let mut running = FuturesUnordered::new();
+    let store = manager.store.clone();
+    let (finished, mut done) = mpsc::unbounded();
     let mut in_flight = HashSet::new();
     let mut start = true;
     loop {
@@ -262,52 +259,35 @@ pub(super) async fn run<S: Store>(
                 next_due = Some(next_due.map_or(job.due_at, |due: u64| due.min(job.due_at)));
             } else if in_flight.len() < CONCURRENT {
                 in_flight.insert(job.id);
-                let manager = manager.clone();
-                running.push(
-                    async move {
-                        let result = manager.run_job(&job.job).await;
-                        (job, result)
-                    }
-                    .boxed_local(),
-                );
+                let (manager, told, finished) = (manager.clone(), told.clone(), finished.clone());
+                tokio::task::spawn_local(async move {
+                    let mut store = manager.store.clone();
+                    let result = manager.run_job(&job.job).await;
+                    let id = job.id;
+                    settle(&mut store, &told, job, result).await;
+                    let _ = finished.unbounded_send(id);
+                });
             }
         }
         start = false;
 
-        let finished = {
-            let done = async {
-                if running.is_empty() {
-                    future::pending().await
-                } else {
-                    running.next().await
+        let sleep = async {
+            match next_due {
+                Some(due) => {
+                    tokio::time::sleep(Duration::from_millis(due.saturating_sub(now_ms))).await
                 }
-            };
-            let woken = async {
-                let sleep = async {
-                    match next_due {
-                        Some(due) => {
-                            tokio::time::sleep(Duration::from_millis(due.saturating_sub(now_ms)))
-                                .await
-                        }
-                        None => future::pending().await,
-                    }
-                };
-                pin_mut!(sleep);
-                let notified = wake.notified();
-                pin_mut!(notified);
-                future::select(sleep, notified).await;
-            };
-            pin_mut!(done, woken);
-            match future::select(done, woken).await {
-                Either::Left((finished, _)) => finished,
-                Either::Right(_) => None,
+                None => future::pending().await,
             }
         };
-        let Some((job, result)) = finished else {
-            continue;
+        let woken = async {
+            let notified = wake.notified();
+            pin_mut!(sleep, notified);
+            future::select(sleep, notified).await;
         };
-        in_flight.remove(&job.id);
-        settle(&mut store, &told, job, result).await;
+        pin_mut!(woken);
+        if let Either::Left((Some(id), _)) = future::select(done.next(), woken).await {
+            in_flight.remove(&id);
+        }
     }
 }
 

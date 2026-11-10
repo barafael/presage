@@ -656,19 +656,15 @@ impl<S: Store> Manager<S, Registered> {
         uuid: Uuid,
         profile_key: ProfileKey,
     ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
-        let profile =
-            if let Some(profile) = self.store.profile(uuid, profile_key).await.ok().flatten() {
-                profile
-            } else {
-                self.retrieve_profile_by_uuid(uuid, profile_key).await?
-            };
+        // Fetched again when no longer current, with its picture if that changed.
+        let profile = self.retrieve_profile_by_uuid(uuid, profile_key).await?;
 
         // A profile without one has none, whatever was cached before it was removed.
         let Some(avatar) = profile.avatar.as_ref() else {
             return Ok(None);
         };
 
-        // Kept up to date by `refresh_profile`.
+        // Kept up to date by `refresh_profile`, which the line above runs when due.
         if let Some(avatar) = self
             .store
             .profile_avatar(uuid, profile_key)
@@ -1848,8 +1844,7 @@ async fn download_sticker<C: ContentsStore>(
 }
 
 /// Keeps `message` as [`keep`] does, its sender's profile key first: sending to them by sealed
-/// sender needs it. A new sender, one with a new key, and one whose profile is no longer
-/// [current](Replica::max_age) get their profile fetched by a [`Job`].
+/// sender needs it. A new sender, and one with a new key, get their name fetched by a [`Job`].
 async fn save_message<S: Store>(
     store: &mut S,
     jobs_wake: &tokio::sync::Notify,
@@ -1887,9 +1882,7 @@ async fn save_message<S: Store>(
                     debug!(sender = %sender.service_id_string(), "inserting profile key for");
                     store.upsert_profile_key(&aci.into(), profile_key).await?;
                 }
-                let replica = Replica::Profile(aci.into());
-                let stale = stale(&replica, store.replica(&replica).await?, replicas::now());
-                if changed || stale || store.contact_by_id(&sender).await?.is_none() {
+                if changed || store.contact_by_id(&sender).await?.is_none() {
                     let job = Job::FetchProfile {
                         aci: Uuid::from(aci).into_bytes(),
                         profile_key: profile_key_bytes,

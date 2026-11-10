@@ -67,6 +67,7 @@ use super::settings::{Settings, SharedSettings};
 use crate::model::contacts::Contact;
 use crate::model::jobs::Job;
 use crate::model::previews;
+use crate::model::replicas::{self, stale, Freshness, Replica};
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
 use crate::{model::groups::Group, AvatarBytes, Error, Manager};
@@ -485,45 +486,41 @@ impl<S: Store> Manager<S, Registered> {
             .await
     }
 
-    /// Fetches the profile of the provided user by UUID and profile key.
+    /// The profile of the provided user by UUID and profile key: the stored one while it is
+    /// [current](Replica::max_age), fetched again once it isn't, and the stored one still when
+    /// that fails.
     pub async fn retrieve_profile_by_uuid(
         &mut self,
         aci: impl Into<Aci>,
         profile_key: ProfileKey,
     ) -> Result<Profile, Error<S::Error>> {
         let aci = aci.into();
-
-        // Check if profile is cached.
-        // TODO: Create a migration in the store removing all profiles.
-        // TODO: Is there some way to know if this is outdated?
-        if let Some(profile) = self
+        let cached = self
             .store
             .profile(aci.into(), profile_key)
             .await
             .ok()
-            .flatten()
-        {
-            return Ok(profile);
+            .flatten();
+        if let Some(profile) = &cached {
+            let replica = Replica::Profile(aci.into());
+            let freshness = self.store.replica(&replica).await.ok().flatten();
+            if !stale(&replica, freshness, replicas::now()) {
+                return Ok(profile.clone());
+            }
         }
-
-        let mut account_manager = AccountManager::new(
-            self.identified_push_service(),
-            self.identified_websocket(false).await?,
-            Some(profile_key),
-        );
-
-        let profile = account_manager.retrieve_profile(aci).await?;
-
-        let _ = self
-            .store
-            .save_profile(aci.into(), profile_key, profile.clone())
-            .await;
-        Ok(profile)
+        match (self.refresh_profile(aci, profile_key).await, cached) {
+            (Ok(profile), _) => Ok(profile),
+            (Err(error), Some(cached)) => {
+                warn!(%error, "failed to fetch a profile again; the stored one will do");
+                Ok(cached)
+            }
+            (Err(error), None) => Err(error),
+        }
     }
 
-    /// Fetches the profile of `aci` from the server even when one is cached, and caches it:
-    /// a new picture or name doesn't change the profile key, so the cached one may be out of
-    /// date. A changed avatar is downloaded and cached too.
+    /// Fetches the profile of `aci` from the server even when one is stored, and stores it:
+    /// a new picture or name doesn't change the profile key, so the stored one may be out of
+    /// date. A changed avatar is downloaded and stored too.
     pub async fn refresh_profile(
         &mut self,
         aci: impl Into<Aci>,
@@ -557,6 +554,10 @@ impl<S: Store> Manager<S, Registered> {
                 .save_profile_avatar(aci.into(), profile_key, &avatar)
                 .await;
         }
+        let _ = self
+            .store
+            .set_replica(&Replica::Profile(aci.into()), Freshness::now(None))
+            .await;
         Ok(profile)
     }
 
@@ -1664,7 +1665,20 @@ async fn sync_groups_from_storage_service<S: Store>(
         .ok_or(Error::MissingKeyError("master_key".into()))?;
     let storage = StorageService::new(push_service, keys.storage_key()).await?;
 
-    let manifest = storage.manifest().await?;
+    // Unchanged since it was read: no group is new.
+    let replica = Replica::StorageManifest;
+    let read = store.replica(&replica).await?.and_then(|read| read.version);
+    let manifest = match read {
+        Some(version) => match storage.manifest_if_changed(version).await? {
+            Some(manifest) => manifest,
+            None => {
+                debug!(version, "the storage manifest is unchanged");
+                return Ok(());
+            }
+        },
+        None => storage.manifest().await?,
+    };
+    let mut complete = true;
     let group_ids: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
@@ -1684,6 +1698,7 @@ async fn sync_groups_from_storage_service<S: Store>(
             Ok(records) => records,
             Err(error) => {
                 warn!(%error, "failed to read group records from the storage service");
+                complete = false;
                 continue;
             }
         };
@@ -1694,8 +1709,14 @@ async fn sync_groups_from_storage_service<S: Store>(
             if let Err(error) = save_unknown_group(store, groups_manager, &record.master_key).await
             {
                 warn!(%error, "failed to fetch group listed in the storage service");
+                complete = false;
             }
         }
+    }
+    // Read again in full unless all of it was read.
+    if complete {
+        let freshness = Freshness::now(Some(manifest.version));
+        store.clone().set_replica(&replica, freshness).await?;
     }
     Ok(())
 }
@@ -1818,8 +1839,8 @@ async fn download_sticker<C: ContentsStore>(
 }
 
 /// Keeps `message` as [`keep`] does, its sender's profile key first: sending to them by sealed
-/// sender needs it. A new sender, or one with a new key, gets their profile fetched by a
-/// [`Job`].
+/// sender needs it. A new sender, one with a new key, and one whose profile is no longer
+/// [current](Replica::max_age) get their profile fetched by a [`Job`].
 async fn save_message<S: Store>(
     store: &mut S,
     jobs_wake: &tokio::sync::Notify,
@@ -1857,7 +1878,9 @@ async fn save_message<S: Store>(
                     debug!(sender = %sender.service_id_string(), "inserting profile key for");
                     store.upsert_profile_key(&aci.into(), profile_key).await?;
                 }
-                if changed || store.contact_by_id(&sender).await?.is_none() {
+                let replica = Replica::Profile(aci.into());
+                let stale = stale(&replica, store.replica(&replica).await?, replicas::now());
+                if changed || stale || store.contact_by_id(&sender).await?.is_none() {
                     let job = Job::FetchProfile {
                         aci: Uuid::from(aci).into_bytes(),
                         profile_key: profile_key_bytes,
@@ -1872,25 +1895,17 @@ async fn save_message<S: Store>(
     keep(store, message, Some(thread)).await
 }
 
-/// Fetches the profile of `aci` and saves them as a contact by its name.
-async fn upsert_contact_from_profile<S: Store>(
-    mut store: S,
-    mut identified_websocket: SignalWebSocket<websocket::Identified>,
+/// Saves `aci` as a contact by the name of their `profile`; what a contacts sync or the client
+/// saved of them otherwise stays.
+async fn save_contact_from_profile<S: Store>(
+    store: &mut S,
     aci: Aci,
     profile_key: ProfileKey,
+    profile: Profile,
     expire_timer: u32,
     expire_timer_version: u32,
 ) -> Result<(), Error<<S as Store>::Error>> {
-    let sender_uuid: Uuid = aci.into();
-    let encrypted_profile = identified_websocket
-        .retrieve_profile_by_id(aci, Some(profile_key))
-        .await?;
-    let profile_cipher = ProfileCipher::new(profile_key);
-    let decrypted_profile = profile_cipher.decrypt(encrypted_profile)?;
-
-    // What a contacts sync or the client saved of them stays; the name is the profile's.
-    let known = store.contact_by_id(&aci.into()).await?;
-    let name = decrypted_profile
+    let name = profile
         .name
         // FIXME: this assumes [firstname] [lastname]
         .map(|pn| {
@@ -1901,14 +1916,14 @@ async fn upsert_contact_from_profile<S: Store>(
             }
         })
         .unwrap_or_default();
-    let contact = match known {
+    let contact = match store.contact_by_id(&aci.into()).await? {
         Some(known) => Contact {
             name,
             profile_key: profile_key.bytes.to_vec(),
             ..known
         },
         None => Contact {
-            uuid: sender_uuid,
+            uuid: aci.into(),
             phone_number: None,
             name,
             profile_key: profile_key.bytes.to_vec(),
@@ -1919,8 +1934,6 @@ async fn upsert_contact_from_profile<S: Store>(
             verified: Verified::default(),
         },
     };
-
-    info!(%sender_uuid, "saved contact from their profile");
     store.save_contact(&contact).await?;
     Ok(())
 }

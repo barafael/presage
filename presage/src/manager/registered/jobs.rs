@@ -19,7 +19,7 @@ use libsignal_service::zkgroup::profiles::ProfileKey;
 use tracing::{debug, error, warn};
 
 use super::groups::update_group;
-use super::{download_sticker_pack, upsert_contact_from_profile, Registered};
+use super::{download_sticker_pack, save_contact_from_profile, Registered};
 use crate::model::jobs::{backoff, Job, QueuedJob};
 use crate::model::messages::Received;
 use crate::store::Store;
@@ -44,12 +44,12 @@ impl<S: Store> Manager<S, Registered> {
                 if current.is_some_and(|current| current.bytes != profile_key.bytes) {
                     return Ok(Vec::new());
                 }
-                let websocket = self.identified_websocket(false).await?;
-                upsert_contact_from_profile(
-                    self.store.clone(),
-                    websocket,
+                let profile = self.refresh_profile(aci, profile_key).await?;
+                save_contact_from_profile(
+                    &mut self.store,
                     aci,
                     profile_key,
+                    profile,
                     *expire_timer,
                     *expire_timer_version,
                 )

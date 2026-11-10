@@ -13,6 +13,7 @@ use presage::{
         contacts::Contact,
         groups::{Group, GroupSenderKey, SharedDevice},
         jobs::{Job, QueuedJob},
+        replicas::{Freshness, Replica},
     },
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
@@ -52,6 +53,9 @@ impl ContentsStore for SqliteStore {
             .execute(&mut *transaction)
             .await?;
         query!("DELETE FROM profile_avatars")
+            .execute(&mut *transaction)
+            .await?;
+        query!("DELETE FROM replicas WHERE kind = 'profile'")
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await.into_protocol_error()?;
@@ -243,12 +247,52 @@ impl ContentsStore for SqliteStore {
         u64::try_from(id).map_err(|_| SqliteStoreError::InvalidFormat)
     }
 
+    async fn replica(
+        &self,
+        replica: &Replica,
+    ) -> Result<Option<Freshness>, Self::ContentsStoreError> {
+        let (kind, id) = (replica.kind(), replica.id());
+        let row = query!(
+            r#"SELECT version AS "version: u64", fetched_at AS "fetched_at: u64"
+            FROM replicas WHERE kind = ? AND id = ?"#,
+            kind,
+            id,
+        )
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(row.map(|row| Freshness {
+            version: row.version,
+            fetched_at: row.fetched_at,
+        }))
+    }
+
+    async fn set_replica(
+        &mut self,
+        replica: &Replica,
+        freshness: Freshness,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let (kind, id) = (replica.kind(), replica.id());
+        let version = freshness.version.map(|version| version as i64);
+        let fetched_at = freshness.fetched_at as i64;
+        query!(
+            "INSERT OR REPLACE INTO replicas (kind, id, version, fetched_at) VALUES (?, ?, ?, ?)",
+            kind,
+            id,
+            version,
+            fetched_at,
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     async fn enqueue_job(&mut self, job: &Job) -> Result<(), Self::ContentsStoreError> {
         let key = job.key();
         let job = serde_json::to_string(job)?;
         query!(
             "INSERT INTO jobs (key, job) VALUES (?, ?)
-            ON CONFLICT (key) DO UPDATE SET job = excluded.job, attempts = 0, due_at = 0",
+            ON CONFLICT (key) DO UPDATE SET job = excluded.job, attempts = 0, due_at = 0
+            WHERE job <> excluded.job",
             key,
             job,
         )
@@ -616,6 +660,10 @@ impl ContentsStore for SqliteStore {
             .execute(&mut *transaction)
             .await?;
         query!("DELETE FROM left_groups")
+            .execute(&mut *transaction)
+            .await?;
+        // The groups the storage service lists are read again.
+        query!("DELETE FROM replicas WHERE kind = 'storage-manifest'")
             .execute(&mut *transaction)
             .await?;
         query!("DELETE FROM group_sender_keys")
@@ -1293,6 +1341,50 @@ mod test {
         // The one that ran meanwhile doesn't take the new one with it.
         store.finish_job(&running).await?;
         assert_eq!(store.jobs().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_same_job_queued_again_keeps_waiting() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        store.enqueue_job(&Job::SyncStorage).await?;
+        let failed = store.jobs().await?.remove(0);
+        store.retry_job(&failed, 5_000).await?;
+
+        store.enqueue_job(&Job::SyncStorage).await?;
+        let waiting = &store.jobs().await?[0];
+        assert_eq!((waiting.attempts, waiting.due_at), (1, 5_000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replica_is_as_fresh_as_last_noted() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let profile = Replica::Profile(Uuid::from_u128(7));
+        assert_eq!(store.replica(&profile).await?, None);
+
+        let fetched = |fetched_at| Freshness {
+            version: None,
+            fetched_at,
+        };
+        store.set_replica(&profile, fetched(1_000)).await?;
+        store.set_replica(&profile, fetched(2_000)).await?;
+        assert_eq!(store.replica(&profile).await?, Some(fetched(2_000)));
+        assert_eq!(
+            store.replica(&Replica::Profile(Uuid::from_u128(8))).await?,
+            None
+        );
+
+        let manifest = Freshness {
+            version: Some(3),
+            fetched_at: 1_000,
+        };
+        store
+            .set_replica(&Replica::StorageManifest, manifest)
+            .await?;
+        store.clear_groups().await?;
+        assert_eq!(store.replica(&Replica::StorageManifest).await?, None);
+        assert_eq!(store.replica(&profile).await?, Some(fetched(2_000)));
         Ok(())
     }
 }

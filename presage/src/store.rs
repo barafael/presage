@@ -30,6 +30,7 @@ use crate::{
         contacts::Contact,
         groups::{Group, GroupSenderKey, SharedDevice},
         jobs::{Job, QueuedJob},
+        replicas::{Freshness, Replica},
     },
     AvatarBytes,
 };
@@ -194,7 +195,8 @@ pub trait ContentsStore: Send + Sync {
     fn handled(&mut self, id: u64) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     /// Queues `job` until it is [finished](ContentsStore::finish_job), due at once. One job
-    /// waits per [key](Job::key): this one takes the place of one waiting with the same.
+    /// waits per [key](Job::key): this one takes the place of a different one waiting with
+    /// the same, and leaves the same one waiting as it is.
     fn enqueue_job(
         &mut self,
         job: &Job,
@@ -441,6 +443,21 @@ pub trait ContentsStore: Send + Sync {
         uuid: Uuid,
         key: ProfileKey,
     ) -> impl Future<Output = Result<Option<AvatarBytes>, Self::ContentsStoreError>>;
+
+    // Replicas
+
+    /// How current the copy of `replica` is, if it was ever fetched.
+    fn replica(
+        &self,
+        replica: &Replica,
+    ) -> impl Future<Output = Result<Option<Freshness>, Self::ContentsStoreError>> + Send;
+
+    /// Notes that the copy of `replica` was fetched.
+    fn set_replica(
+        &mut self,
+        replica: &Replica,
+        freshness: Freshness,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send;
 
     // Stickers
 

@@ -352,8 +352,11 @@ where
         }
     }
 
-    /// Handles a decrypted content: stores it, and what else it asks for.
+    /// Handles a decrypted content: stores it, and what else it asks for, as far as its
+    /// [`Origin`] may ask it.
     async fn handle(&mut self, content: Content) -> Option<Received> {
+        let origin = Origin::of(&content, &self.service_ids);
+
         if let ContentBody::DecryptionErrorMessage(message) = content.body {
             warn!(
                 sender = %content.metadata.sender.service_id_string(),
@@ -368,20 +371,41 @@ where
             });
         }
 
-        if let ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::Request(request)),
-            ..
-        }) = &content.body
-        {
+        match (&origin, &content.body) {
+            (Origin::Unauthenticated, _) => {
+                warn!(
+                    sender = %content.metadata.sender.service_id_string(),
+                    "dropping plaintext content that is no retry receipt"
+                );
+                return None;
+            }
+            (Origin::Peer, ContentBody::SynchronizeMessage(_)) => {
+                warn!(
+                    sender = %content.metadata.sender.service_id_string(),
+                    "dropping a sync message from another account"
+                );
+                return None;
+            }
+            (Origin::Own, ContentBody::SynchronizeMessage(sync)) => {
+                if let Some(received) = self.handle_sync(OwnSync(sync)).await {
+                    return Some(received);
+                }
+            }
+            (Origin::Own | Origin::Peer, _) => {}
+        }
+
+        self.handle_message(content).await
+    }
+
+    /// What only our own devices may ask: answers, the account's contacts, keys and sticker
+    /// packs. Returns what to tell when the message is nothing more than that.
+    async fn handle_sync(&mut self, OwnSync(sync): OwnSync<'_>) -> Option<Received> {
+        if let Some(SyncContent::Request(request)) = &sync.content {
             self.answer(request.r#type()).await;
         }
 
         // contacts synchronization sent from the primary device (happens after linking, or on demand)
-        if let ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::Contacts(contacts)),
-            ..
-        }) = &content.body
-        {
+        if let Some(SyncContent::Contacts(contacts)) = &sync.content {
             match self.message_receiver.retrieve_contacts(contacts).await {
                 Ok(contacts) => {
                     info!("saving contacts");
@@ -401,12 +425,8 @@ where
         }
 
         // sticker pack operations
-        if let ContentBody::SynchronizeMessage(SyncMessage {
-            sticker_pack_operation,
-            ..
-        }) = &content.body
         {
-            for operation in sticker_pack_operation {
+            for operation in &sync.sticker_pack_operation {
                 match operation.r#type() {
                     sticker_pack_operation::Type::Install => {
                         let store = self.store.clone();
@@ -442,11 +462,7 @@ where
         }
 
         // key synchronization sent from the primary device
-        if let ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::Keys(keys)),
-            ..
-        }) = &content.body
-        {
+        if let Some(SyncContent::Keys(keys)) = &sync.content {
             debug!("received key sync message");
             if self.registration_type == RegistrationType::Primary {
                 warn!("received a key sync message as a primary device; ignoring")
@@ -472,11 +488,7 @@ where
         }
 
         // The primary device told us to fetch stuff again from the storage service.
-        if let ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(SyncContent::FetchLatest(fetch_latest)),
-            ..
-        }) = &content.body
-        {
+        if let Some(SyncContent::FetchLatest(fetch_latest)) = &sync.content {
             if fetch_latest.r#type() == sync_message::fetch_latest::Type::StorageManifest {
                 if let Err(error) = sync_groups_from_storage_service(
                     &self.store,
@@ -490,6 +502,11 @@ where
             }
         }
 
+        None
+    }
+
+    /// Keeps a message from a peer or from one of our devices, its group brought up to date first.
+    async fn handle_message(&mut self, content: Content) -> Option<Received> {
         // group update
         if let ContentBody::DataMessage(DataMessage {
             group_v2:
@@ -573,12 +590,18 @@ where
         let mut message_sender = self.message_sender.clone();
         match request {
             RequestType::Contacts => {
-                let contacts = self
-                    .store
-                    .contacts()
-                    .await
-                    .map(|i| i.collect::<Result<Vec<_>, _>>().unwrap_or_default())
-                    .unwrap_or_default();
+                // All of them or no answer: the answer is complete, and replaces what they have.
+                let contacts = match self.store.contacts().await {
+                    Ok(contacts) => contacts.collect::<Result<Vec<_>, _>>(),
+                    Err(error) => Err(error),
+                };
+                let contacts = match contacts {
+                    Ok(contacts) => contacts,
+                    Err(error) => {
+                        warn!(%error, "not answering a contacts request: failed to read them");
+                        return;
+                    }
+                };
                 let aci = self.service_ids.aci();
                 tokio::task::spawn_local(async move {
                     let result = message_sender
@@ -629,25 +652,9 @@ where
                     }
                 });
             }
+            // No block list is stored, and an empty answer would clear the requester's.
             RequestType::Blocked => {
-                warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
-                tokio::task::spawn_local(async move {
-                    let result = message_sender
-                        .send_sync_message(SyncMessage {
-                            content: Some(SyncContent::Blocked(sync_message::Blocked {
-                                numbers: vec![],
-                                acis: vec![],
-                                acis_binary: vec![],
-                                group_ids: vec![],
-                            })),
-                            ..SyncMessage::with_padding(&mut rand::rng())
-                        })
-                        .await;
-
-                    if let Err(error) = result {
-                        warn!(%error, "Error sending blocked contacts to other devices");
-                    }
-                });
+                warn!("not answering a request for the block list: none is stored");
             }
             t => {
                 info!(type = ?t, "Got sync request of currently unhandled type")
@@ -655,6 +662,33 @@ where
         }
     }
 }
+
+/// Who a decrypted content is from, decided once: what it may ask of this device follows from
+/// it, and nowhere else.
+enum Origin {
+    /// One of this account's devices, by a session with it.
+    Own,
+    /// Another account, by a session with it.
+    Peer,
+    /// A plaintext envelope: nothing shows who wrote it. Signal's apps take a retry receipt
+    /// from one and nothing else.
+    Unauthenticated,
+}
+
+impl Origin {
+    fn of(content: &Content, own: &ServiceIds) -> Self {
+        if content.metadata.was_plaintext {
+            Self::Unauthenticated
+        } else if content.metadata.sender == ServiceId::from(own.aci()) {
+            Self::Own
+        } else {
+            Self::Peer
+        }
+    }
+}
+
+/// A sync message of [`Origin::Own`]: only that changes the account's state on this device.
+struct OwnSync<'a>(&'a SyncMessage);
 
 /// Who failed to decrypt with which error, if that is known: a sealed sender once their
 /// certificate checked out, an unsealed one from the envelope.
@@ -751,4 +785,56 @@ async fn register_pre_keys<S: Store>(
 
     trace!("registered pre keys");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use libsignal_service::content::{Content, ContentBody, Metadata};
+    use libsignal_service::prelude::Uuid;
+    use libsignal_service::proto::NullMessage;
+    use libsignal_service::protocol::{Aci, ServiceId};
+    use libsignal_service::push_service::ServiceIds;
+
+    use super::Origin;
+
+    fn content(sender: Uuid, was_plaintext: bool) -> Content {
+        let sender: ServiceId = Aci::from(sender).into();
+        let now = chrono::Utc::now();
+        Content {
+            metadata: Metadata {
+                sender,
+                sender_device: 1.try_into().unwrap(),
+                destination: sender,
+                server_guid: None,
+                client_timestamp: now,
+                server_timestamp: now,
+                needs_receipt: false,
+                unidentified_sender: false,
+                was_plaintext,
+                pni_verified: None,
+            },
+            body: ContentBody::NullMessage(NullMessage::default()),
+        }
+    }
+
+    #[test]
+    fn origin_is_decided_by_session_and_sender() {
+        let own = ServiceIds {
+            aci: Uuid::from_u128(1),
+            pni: Uuid::from_u128(2),
+        };
+        assert!(matches!(
+            Origin::of(&content(own.aci, false), &own),
+            Origin::Own
+        ));
+        assert!(matches!(
+            Origin::of(&content(Uuid::from_u128(3), false), &own),
+            Origin::Peer
+        ));
+        // Not ours either, whoever the envelope names.
+        assert!(matches!(
+            Origin::of(&content(own.aci, true), &own),
+            Origin::Unauthenticated
+        ));
+    }
 }

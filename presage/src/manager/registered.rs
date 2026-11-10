@@ -583,10 +583,7 @@ impl<S: Store> Manager<S, Registered> {
         &mut self,
         context: GroupContextV2,
     ) -> Result<Option<AvatarBytes>, Error<S::Error>> {
-        let master_key_bytes = context
-            .master_key()
-            .try_into()
-            .expect("Master key bytes to be of size 32.");
+        let master_key_bytes = context.master_key().try_into()?;
 
         // Cached, and kept current by `upsert_group`; empty means the group has none.
         if let Some(avatar) = self
@@ -963,9 +960,7 @@ impl<S: Store> Manager<S, Registered> {
         timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
         let mut content_body = message.into();
-        let master_key_bytes = master_key_bytes
-            .try_into()
-            .expect("Master key bytes to be of size 32.");
+        let master_key_bytes = master_key_bytes.try_into()?;
         let thread = Thread::Group(master_key_bytes);
 
         self.restore_thread_timer(&thread, &mut content_body).await;

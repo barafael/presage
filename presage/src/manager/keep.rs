@@ -22,7 +22,8 @@ const DELETE_FOR_EVERYONE_WINDOW_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Kept {
-    /// Stored in `thread` under `timestamp`, where [`ContentsStore::message`] finds it.
+    /// Stored in `thread` under its sender and `timestamp`, where [`ContentsStore::message`]
+    /// finds it.
     ///
     /// [`ContentsStore::message`]: crate::store::ContentsStore::message
     Stored { thread: Thread, timestamp: u64 },
@@ -30,8 +31,8 @@ pub enum Kept {
     Edited { thread: Thread, timestamp: u64 },
     /// The message sent at `timestamp` deleted for everyone.
     Deleted { thread: Thread, timestamp: u64 },
-    /// Nothing stored: there was nothing to store, or it wasn't the sender's to change (see the
-    /// log).
+    /// Nothing stored: there was nothing to store, or what it names isn't its sender's (see
+    /// the log).
     NotStored,
 }
 
@@ -118,7 +119,7 @@ pub async fn keep<S: Store>(
                     continue;
                 };
                 // Gone, not marked deleted: Signal-Desktop takes it out of the timeline too.
-                let result = store.delete_message(&thread, timestamp).await;
+                let result = store.delete_message(&thread, &sender, timestamp).await;
                 if !result.is_ok_and(|d| d) {
                     warn!(
                         "Could not delete message referenced by delete-for-self message; ignoring."
@@ -171,20 +172,13 @@ pub async fn keep<S: Store>(
         }
     };
 
-    // Messages are stored by thread and time, so a sender's message must not take the place of
-    // someone else's, and a receipt at the millisecond of a message must not take its place
-    // or keep it out.
     let timestamp = stored.metadata.client_timestamp.timestamp_millis() as u64;
-    let receipt = |content: &Content| matches!(content.body, ContentBody::ReceiptMessage(_));
-    match store.message(&thread, timestamp).await? {
-        Some(existing) if receipt(&stored) && !receipt(&existing) => {
-            debug!(%thread, timestamp, "not saving a receipt in the place of a message");
-            Ok(Kept::NotStored)
-        }
-        Some(existing)
-            if existing.metadata.sender != stored.metadata.sender && !receipt(&existing) =>
-        {
-            warn!(%thread, timestamp, "not saving a message in the place of someone else's");
+    match store
+        .message(&thread, &stored.metadata.sender, timestamp)
+        .await?
+    {
+        Some(existing) if !replaces(&existing, &stored) => {
+            debug!(%thread, timestamp, "not saving a message in the place of its sender's other one");
             Ok(Kept::NotStored)
         }
         _ => {
@@ -194,21 +188,35 @@ pub async fn keep<S: Store>(
     }
 }
 
-/// Replaces the sender's message sent at `target` by an empty `NullMessage`, if it is recent
-/// enough.
+/// Whether `message` takes the place of `existing`, its sender's at the same time in a thread.
+/// A receipt doesn't take a message's place, nor keep it out. Of two messages one account's
+/// devices sent at one millisecond, the first stays: they have one name, and the first is the
+/// one already handed on. An edit takes its message's place from any of them.
+fn replaces(existing: &Content, message: &Content) -> bool {
+    let receipt = |content: &Content| matches!(content.body, ContentBody::ReceiptMessage(_));
+    receipt(existing)
+        || !receipt(message)
+            && (existing.metadata.sender_device == message.metadata.sender_device
+                || message.edited_at().is_some())
+}
+
+/// Replaces the sender's message sent at `target` by an empty `NullMessage` of nobody's, if it
+/// is recent enough. Only the sender's own is found: a message is known by its sender and time.
 async fn delete_for_everyone<S: Store>(
     store: &mut S,
     thread: Thread,
     message: &Content,
     target: u64,
 ) -> Result<Kept, Error<S::Error>> {
+    let sender = message.metadata.sender;
     let sent = message.metadata.client_timestamp.timestamp_millis() as u64;
-    match store.message_sent_or_edited_at(&thread, target).await? {
-        Some(mut existing)
-            if existing.metadata.sender == message.metadata.sender
-                && sent.saturating_sub(target) < DELETE_FOR_EVERYONE_WINDOW_MS =>
-        {
+    match store
+        .message_sent_or_edited_at(&thread, &sender, target)
+        .await?
+    {
+        Some(mut existing) if sent.saturating_sub(target) < DELETE_FOR_EVERYONE_WINDOW_MS => {
             let timestamp = existing.metadata.client_timestamp.timestamp_millis() as u64;
+            store.delete_message(&thread, &sender, timestamp).await?;
             existing.metadata.sender = Aci::from(Uuid::nil()).into();
             existing.body = NullMessage::default().into();
             store.save_message(&thread, existing).await?;
@@ -216,26 +224,29 @@ async fn delete_for_everyone<S: Store>(
             Ok(Kept::Deleted { thread, timestamp })
         }
         Some(_) => {
-            warn!(%thread, target, "ignoring delete of a message by someone else or too old");
+            warn!(%thread, target, "ignoring delete of a message too old");
             Ok(Kept::NotStored)
         }
         None => {
-            warn!(%thread, target, "could not find message to delete in thread");
+            warn!(%thread, target, "could not find the sender's message to delete in thread");
             Ok(Kept::NotStored)
         }
     }
 }
 
-/// Stores an edit in the place of the message it edits, which must be its sender's, naming it
-/// by its first time, also when the edit names an earlier edit's.
+/// Stores an edit in the place of its sender's message it edits, naming it by its first time,
+/// also when the edit names an earlier edit's.
 async fn edit<S: Store>(
     store: &mut S,
     thread: Thread,
     message: &Content,
     target: u64,
 ) -> Result<Kept, Error<S::Error>> {
-    match store.message_sent_or_edited_at(&thread, target).await? {
-        Some(original) if original.metadata.sender == message.metadata.sender => {
+    match store
+        .message_sent_or_edited_at(&thread, &message.metadata.sender, target)
+        .await?
+    {
+        Some(original) => {
             let mut edit = message.clone();
             edit.metadata.client_timestamp = original.metadata.client_timestamp;
             retarget_edit(&mut edit, original.timestamp());
@@ -243,8 +254,8 @@ async fn edit<S: Store>(
             store.save_message(&thread, edit).await?;
             Ok(Kept::Edited { thread, timestamp })
         }
-        _ => {
-            warn!(%thread, target, "ignoring edit of a message by someone else or not found");
+        None => {
+            warn!(%thread, target, "ignoring edit of a message that isn't its sender's or not found");
             Ok(Kept::NotStored)
         }
     }
@@ -262,5 +273,86 @@ fn retarget_edit(edit: &mut Content, original: u64) {
         })
         | ContentBody::EditMessage(edit) => edit.target_sent_timestamp = Some(original),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use libsignal_service::{
+        content::{Content, ContentBody, Metadata},
+        prelude::Uuid,
+        proto::{receipt_message, DataMessage, EditMessage, ReceiptMessage},
+        protocol::{Aci, ServiceId},
+    };
+
+    use super::replaces;
+
+    fn from_device(device: u8, body: ContentBody) -> Content {
+        let sender = ServiceId::Aci(Aci::from(Uuid::from_u128(1)));
+        let at = chrono::DateTime::from_timestamp_millis(1_000).unwrap();
+        Content {
+            metadata: Metadata {
+                sender,
+                destination: sender,
+                sender_device: device.try_into().unwrap(),
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt: false,
+                unidentified_sender: false,
+                server_guid: None,
+                was_plaintext: false,
+                pni_verified: None,
+            },
+            body,
+        }
+    }
+
+    fn data(device: u8) -> Content {
+        from_device(
+            device,
+            ContentBody::DataMessage(DataMessage {
+                timestamp: Some(1_000),
+                ..Default::default()
+            }),
+        )
+    }
+
+    fn receipt(device: u8) -> Content {
+        from_device(
+            device,
+            ContentBody::ReceiptMessage(ReceiptMessage {
+                r#type: Some(receipt_message::Type::Read.into()),
+                timestamp: vec![500],
+            }),
+        )
+    }
+
+    fn edit(device: u8) -> Content {
+        from_device(
+            device,
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: Some(1_000),
+                data_message: Some(DataMessage {
+                    timestamp: Some(2_000),
+                    ..Default::default()
+                }),
+            }),
+        )
+    }
+
+    #[test]
+    fn the_first_of_one_accounts_messages_at_a_millisecond_stays() {
+        assert!(replaces(&data(1), &data(1)), "the same device's again");
+        assert!(!replaces(&data(1), &data(2)), "another device's");
+        assert!(replaces(&data(1), &edit(2)), "an edit, from any device");
+        assert!(replaces(&edit(1), &edit(2)), "a later edit");
+    }
+
+    #[test]
+    fn a_receipt_gives_way() {
+        assert!(!replaces(&data(1), &receipt(1)));
+        assert!(replaces(&receipt(1), &data(1)));
+        assert!(replaces(&receipt(1), &data(2)));
+        assert!(replaces(&receipt(1), &receipt(1)));
     }
 }

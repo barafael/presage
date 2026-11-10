@@ -13,6 +13,7 @@ use presage_store_sqlite::{OnNewIdentity, SqliteStore};
 
 const ALICE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const BOB: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const NOBODY: &str = "00000000-0000-0000-0000-000000000000";
 const TWO_DAYS_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 
 fn id(s: &str) -> ServiceId {
@@ -122,7 +123,17 @@ async fn only_the_sender_deletes_their_message() {
             timestamp: 1000
         }
     );
-    let stored = store.message(&thread, 1000).await.unwrap().unwrap();
+    assert!(store
+        .message(&thread, &id(ALICE), 1000)
+        .await
+        .unwrap()
+        .is_none());
+    let nobody = ServiceId::parse_from_service_id_string(NOBODY).unwrap();
+    let stored = store
+        .message(&thread, &nobody, 1000)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(stored.body, ContentBody::NullMessage(_)));
 }
 
@@ -166,7 +177,11 @@ async fn a_second_edit_names_the_first_edits_time() {
             timestamp: 1000
         }
     );
-    let stored = store.message(&thread, 1000).await.unwrap().unwrap();
+    let stored = store
+        .message(&thread, &id(ALICE), 1000)
+        .await
+        .unwrap()
+        .unwrap();
     let ContentBody::EditMessage(edit) = stored.body else {
         panic!("the edit takes the message's place");
     };
@@ -214,7 +229,11 @@ async fn a_receipt_gives_way_to_a_message_at_the_same_millisecond() {
     // The message first: the receipt gives way.
     let again = keep(&mut store, &receipt, None).await.unwrap();
     assert_eq!(again, Kept::NotStored);
-    let stored = store.message(&thread, 1000).await.unwrap().unwrap();
+    let stored = store
+        .message(&thread, &id(ALICE), 1000)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(stored.body, ContentBody::DataMessage(_)));
 }
 
@@ -231,7 +250,7 @@ async fn typing_is_not_stored() {
 }
 
 #[tokio::test]
-async fn a_message_does_not_take_the_place_of_someone_elses() {
+async fn two_senders_messages_at_one_millisecond_are_both_kept() {
     let mut store = store().await;
     let thread = Thread::Contact(id(ALICE));
     keep(&mut store, &text(ALICE, 1000, "mine"), None)
@@ -240,7 +259,47 @@ async fn a_message_does_not_take_the_place_of_someone_elses() {
     let theirs = keep(&mut store, &text(BOB, 1000, "theirs"), Some(thread.clone()))
         .await
         .unwrap();
-    assert_eq!(theirs, Kept::NotStored);
-    let stored = store.message(&thread, 1000).await.unwrap().unwrap();
-    assert_eq!(stored.metadata.sender, id(ALICE));
+    assert_eq!(
+        theirs,
+        Kept::Stored {
+            thread: thread.clone(),
+            timestamp: 1000
+        }
+    );
+    for sender in [ALICE, BOB] {
+        let stored = store
+            .message(&thread, &id(sender), 1000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.metadata.sender, id(sender));
+    }
+}
+
+#[tokio::test]
+async fn a_delete_finds_only_its_senders_message() {
+    let mut store = store().await;
+    let thread = Thread::Contact(id(ALICE));
+    keep(&mut store, &text(ALICE, 1000, "mine"), None)
+        .await
+        .unwrap();
+    keep(&mut store, &text(BOB, 1000, "theirs"), Some(thread.clone()))
+        .await
+        .unwrap();
+    // Bob's delete names the time both were sent at: his goes, hers stays.
+    let deleted = keep(&mut store, &delete(BOB, 2000, 1000), Some(thread.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(deleted, Kept::Deleted { .. }));
+    let hers = store
+        .message(&thread, &id(ALICE), 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(hers.body, ContentBody::DataMessage(_)));
+    assert!(store
+        .message(&thread, &id(BOB), 1000)
+        .await
+        .unwrap()
+        .is_none());
 }

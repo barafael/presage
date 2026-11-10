@@ -438,12 +438,26 @@ async fn print_message<S: Store>(
                 reaction:
                     Some(Reaction {
                         target_sent_timestamp: Some(ts),
+                        target_author_aci,
+                        target_author_aci_binary,
                         emoji: Some(emoji),
                         ..
                     }),
                 ..
             } => {
-                let Ok(Some(message)) = manager.store().message(thread, *ts).await else {
+                let author = target_author_aci_binary
+                    .as_deref()
+                    .and_then(ServiceId::parse_from_service_id_binary)
+                    .or_else(|| {
+                        target_author_aci
+                            .as_deref()
+                            .and_then(ServiceId::parse_from_service_id_string)
+                    });
+                let Some(author) = author else {
+                    warn!(%thread, sent_at = ts, "reaction without its target's author");
+                    return None;
+                };
+                let Ok(Some(message)) = manager.store().message(thread, &author, *ts).await else {
                     warn!(%thread, sent_at = ts, "no message found in thread");
                     return None;
                 };

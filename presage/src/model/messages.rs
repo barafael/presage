@@ -38,6 +38,10 @@ pub enum Received {
     /// Incoming decrypted message with metadata and content, and what was kept of it.
     Content { content: Box<Content>, kept: Kept },
 
+    /// The profile of a sender seen first, or with a new profile key, has been fetched and
+    /// they are saved as a contact by its name.
+    ContactSaved { service_id: ServiceId },
+
     /// A sticker pack installed on another device (announced in a sync message, which comes as
     /// [`Received::Content`] first) has been downloaded and stored: it can be listed now.
     StickerPackInstalled { pack_id: Vec<u8> },

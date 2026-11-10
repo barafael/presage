@@ -1,19 +1,17 @@
-use std::str::FromStr;
-
 use std::collections::VecDeque;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use futures::future::{self, Either};
-use futures::{Stream, StreamExt};
+use futures::{pin_mut, Stream, StreamExt};
 use libsignal_service::cipher::SealedSenderDecryptionError;
 use libsignal_service::content::sync_message::request::Type as RequestType;
 use libsignal_service::envelope::Envelope;
-use libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use libsignal_service::messagepipe::AckHandle;
-use libsignal_service::prelude::{Content, ServiceError};
-use libsignal_service::proto::contact_details;
+use libsignal_service::prelude::{Content, ProtobufMessage, ServiceError};
 use libsignal_service::protocol::{DeviceId, ProtocolAddress, PublicKey};
-use libsignal_service::sender::ContactDetails;
 use libsignal_service::session_lock::SessionLock;
 use libsignal_service::{
     content::ContentBody,
@@ -26,24 +24,17 @@ use libsignal_service::{
     },
     protocol::{IdentityKeyStore, ServiceId, ServiceIdKind},
     push_service::{PushService, ServiceIds},
-    receiver::MessageReceiver,
-    websocket::{
-        self,
-        account::{AccountAttributes, DeviceCapabilities},
-        SignalWebSocket,
-    },
+    websocket::account::{AccountAttributes, DeviceCapabilities},
     AccountManager,
 };
 use rand::rng;
 use tracing::{debug, error, info, trace, warn};
 
 use super::groups::update_group;
-use super::{
-    download_sticker_pack, save_message, sync_groups_from_storage_service, MessageSender,
-    Registered, RegistrationData, RegistrationType, ServiceCipher,
-};
+use super::{jobs, save_message, Registered, RegistrationData, RegistrationType, ServiceCipher};
 use crate::manager::group_credentials::GroupCredentialsCache;
 use crate::manager::Kept;
+use crate::model::jobs::Job;
 use crate::model::messages::Received;
 use crate::store::Store;
 use crate::{Error, Manager};
@@ -55,71 +46,159 @@ impl<S: Store> Manager<S, Registered> {
     /// until giving the ability for users to send messages. That way, all possible updates (sessions, profile keys, sender keys)
     /// are processed _before_ trying to encrypt and send messages, which might get rejected by recipients otherwise.
     ///
-    /// Returns a [futures::Stream] of messages to consume. Messages will also be stored by the implementation of the [Store].
-    pub async fn receive_messages(
-        &mut self,
-    ) -> Result<impl Stream<Item = Received>, Error<S::Error>> {
-        let identified_push_service = self.identified_push_service();
-        // NB: here, we initialise a *fresh* Signal websocket, which means any other use of the previous one will go into nirvana
-        let identified_websocket = self.identified_websocket(true).await?;
+    /// Returns the [`Messages`] to consume. Messages will also be stored by the implementation of the [Store].
+    ///
+    /// Receiving runs on a thread of its own, on the runtime this is called on, until the
+    /// [`Messages`] are dropped: that thread decrypts and stores, and runs the
+    /// [jobs](crate::model::jobs::Job) the store keeps. An envelope is read once the message
+    /// before it was taken from the stream.
+    pub async fn receive_messages(&mut self) -> Result<Messages, Error<S::Error>> {
+        let (events, received) = tokio::sync::mpsc::channel(1);
+        let (ready, started) = oneshot::channel();
+        let manager = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::Builder::new()
+            .name("presage-receive".into())
+            .spawn(move || {
+                // The protocol stores' futures aren't `Send`: they stay on this thread.
+                let local = tokio::task::LocalSet::new();
+                runtime.block_on(local.run_until(drive(manager, ready, events)));
+            })?;
+        started
+            .await
+            .map_err(|_| Error::MessagePipeInterruptedError)??;
+        Ok(Messages { received })
+    }
+}
 
-        let mut account_manager = AccountManager::new(
+/// What [`Manager::receive_messages`] receives, until dropped.
+#[derive(Debug)]
+pub struct Messages {
+    received: tokio::sync::mpsc::Receiver<Received>,
+}
+
+impl Stream for Messages {
+    type Item = Received;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Received>> {
+        self.received.poll_recv(cx)
+    }
+}
+
+/// Receives until the [`Messages`] are dropped or the connection ends, with the jobs running
+/// beside.
+async fn drive<S: Store>(
+    mut manager: Manager<S, Registered>,
+    ready: oneshot::Sender<Result<(), Error<S::Error>>>,
+    events: tokio::sync::mpsc::Sender<Received>,
+) {
+    let (told, background) = mpsc::unbounded();
+    let (mut receiver, mut account_manager) = match Receiver::new(&mut manager, background).await {
+        Ok(started) => {
+            let _ = ready.send(Ok(()));
+            started
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    debug!("starting to consume incoming message stream");
+
+    let store = manager.store.clone();
+    let registration_data = manager.registration_data().clone();
+    tokio::task::spawn_local(async move {
+        if let Err(error) =
+            set_account_attributes(&mut account_manager, &store, &registration_data).await
+        {
+            error!(%error, "failed to set account attributes, this is problematic and should never happen!");
+        }
+        if let Err(error) = register_pre_keys(&store, &mut account_manager).await {
+            error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
+        }
+    });
+    tokio::task::spawn_local(jobs::run(manager, told));
+
+    loop {
+        // An envelope is opened only once there is room to tell of it.
+        let Ok(permit) = events.reserve().await else {
+            return;
+        };
+        let received = {
+            let next = receiver.next();
+            let dropped = events.closed();
+            pin_mut!(next, dropped);
+            match future::select(next, dropped).await {
+                Either::Left((received, _)) => received,
+                // Stopped mid-envelope: it comes again.
+                Either::Right(_) => return,
+            }
+        };
+        match received {
+            Some(received) => permit.send(received),
+            None => return,
+        }
+    }
+}
+
+struct Receiver<S: Store, E> {
+    store: S,
+    envelopes: E,
+    session_lock: SessionLock,
+    trust_roots: Vec<PublicKey>,
+    aci_address: ProtocolAddress,
+    pni_address: ProtocolAddress,
+    groups_manager: GroupsManager<GroupCredentialsCache>,
+    identified_push_service: PushService,
+    service_ids: ServiceIds,
+    registration_type: RegistrationType,
+    jobs_wake: Arc<tokio::sync::Notify>,
+    /// Decrypted and kept before the receiver stopped, but not handled: handled first.
+    decrypted: VecDeque<(u64, Content)>,
+    /// Told before the next envelope is read.
+    pending: VecDeque<Received>,
+    /// What the jobs bring.
+    background: mpsc::UnboundedReceiver<Received>,
+}
+
+type Envelopes = Pin<Box<dyn Stream<Item = Result<Incoming, ServiceError>>>>;
+
+impl<S: Store> Receiver<S, Envelopes> {
+    async fn new(
+        manager: &mut Manager<S, Registered>,
+        background: mpsc::UnboundedReceiver<Received>,
+    ) -> Result<(Self, AccountManager), Error<S::Error>> {
+        let identified_push_service = manager.identified_push_service();
+        // NB: here, we initialise a *fresh* Signal websocket, which means any other use of the previous one will go into nirvana
+        let identified_websocket = manager.identified_websocket(true).await?;
+        let account_manager = AccountManager::new(
             identified_push_service.clone(),
             identified_websocket.clone(),
             None,
         );
+        let service_configuration = manager.state.service_configuration();
+        // A primary makes its pool when first asked.
+        manager.account_entropy_pool().await?;
 
-        let store_inner = self.store.clone();
-        let registration_data_inner = self.registration_data().clone();
-
-        // We make a task to update the account attributes and refresh pre keys as needed that will
-        // only yield a value if one of the two operations fail (stop signal).
-        //
-        // This is necessary because in this context, we can't do the classic tokio::spawn with a
-        // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
-        let refresh_registration_task = async move {
-            if let Err(error) =
-                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
-                    .await
-            {
-                error!(%error, "failed to set account attributes, this is problematic and should never happen!");
-            }
-
-            if let Err(error) = register_pre_keys(&store_inner, &mut account_manager).await {
-                error!(%error, "failed to register pre-keys, this is problematic and should never happen!");
-            }
-
-            // Never return, which keeps the messages stream alive.
-            future::pending::<()>().await
-        };
-
-        let encrypted_messages = MessagePipe::from_socket(identified_websocket.clone());
-        let (stored_packs_sender, stored_packs) = mpsc::unbounded();
-        let service_configuration = self.state.service_configuration();
-
-        let receiver = Receiver {
-            store: self.store.clone(),
-            identified_websocket,
-            unidentified_websocket: self.unidentified_websocket().await?,
-            envelopes: Box::pin(encrypted_messages.stream()),
-            message_receiver: MessageReceiver::new(identified_push_service.clone()),
-            session_lock: self.state.session_lock.clone(),
+        let receiver = Self {
+            store: manager.store.clone(),
+            envelopes: Box::pin(MessagePipe::from_socket(identified_websocket).stream()),
+            session_lock: manager.state.session_lock.clone(),
             trust_roots: service_configuration.unidentified_sender_trust_roots,
             aci_address: ProtocolAddress::new(
-                self.state.data.service_ids.aci().service_id_string(),
-                self.state.device_id(),
+                manager.state.data.service_ids.aci().service_id_string(),
+                manager.state.device_id(),
             ),
             pni_address: ProtocolAddress::new(
-                self.state.data.service_ids.pni().service_id_string(),
-                self.state.device_id(),
+                manager.state.data.service_ids.pni().service_id_string(),
+                manager.state.device_id(),
             ),
-            groups_manager: Box::pin(self.groups_manager()).await?,
+            groups_manager: Box::pin(manager.groups_manager()).await?,
             identified_push_service,
-            service_ids: self.state.data.service_ids.clone(),
-            message_sender: self.new_message_sender().await?,
-            account_entropy_pool: self.account_entropy_pool().await?,
-            registration_type: self.registration_type(),
-            decrypted: self
+            service_ids: manager.state.data.service_ids.clone(),
+            registration_type: manager.registration_type(),
+            jobs_wake: manager.state.jobs_wake.clone(),
+            decrypted: manager
                 .store
                 .decrypted()
                 .await
@@ -129,49 +208,10 @@ impl<S: Store> Manager<S, Registered> {
                 })
                 .into(),
             pending: VecDeque::new(),
-            stored_packs,
-            stored_packs_sender,
+            background,
         };
-
-        debug!("starting to consume incoming message stream");
-
-        let incoming_messages_stream =
-            futures::stream::unfold(receiver, |mut receiver| async move {
-                let received = receiver.next().await?;
-                Some((received, receiver))
-            });
-
-        Ok(Box::pin(
-            // We use the returning of the async closure in take_until as a stop signal
-            // if the future resolves *anything* the stream will end.
-            incoming_messages_stream.take_until(refresh_registration_task),
-        ))
+        Ok((receiver, account_manager))
     }
-}
-
-struct Receiver<S: Store, E> {
-    store: S,
-    identified_websocket: SignalWebSocket<websocket::Identified>,
-    unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
-    envelopes: E,
-    message_receiver: MessageReceiver,
-    session_lock: SessionLock,
-    trust_roots: Vec<PublicKey>,
-    aci_address: ProtocolAddress,
-    pni_address: ProtocolAddress,
-    groups_manager: GroupsManager<GroupCredentialsCache>,
-    identified_push_service: PushService,
-    service_ids: ServiceIds,
-    message_sender: MessageSender<S::AciStore>,
-    account_entropy_pool: Option<AccountEntropyPool>,
-    registration_type: RegistrationType,
-    /// Decrypted and kept before the receiver stopped, but not handled: handled first.
-    decrypted: VecDeque<(u64, Content)>,
-    /// Told before the next envelope is read.
-    pending: VecDeque<Received>,
-    /// The ids of sticker packs installed elsewhere, once stored in the background.
-    stored_packs: mpsc::UnboundedReceiver<Vec<u8>>,
-    stored_packs_sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 /// What an envelope held.
@@ -205,14 +245,12 @@ where
                 self.pending.extend(received);
                 continue;
             }
-            let incoming =
-                match future::select(self.stored_packs.next(), self.envelopes.next()).await {
-                    Either::Left((Some(pack_id), _)) => {
-                        return Some(Received::StickerPackInstalled { pack_id })
-                    }
-                    Either::Left((None, incoming)) => incoming.await,
-                    Either::Right((incoming, _)) => incoming,
-                };
+            let incoming = match future::select(self.background.next(), self.envelopes.next()).await
+            {
+                Either::Left((Some(received), _)) => return Some(received),
+                Either::Left((None, incoming)) => incoming.await,
+                Either::Right((incoming, _)) => incoming,
+            };
             match incoming {
                 Some(Ok(Incoming::Envelope { envelope, ack })) => {
                     match self.open(envelope, ack).await {
@@ -227,26 +265,13 @@ where
                 }
                 Some(Ok(Incoming::QueueEmpty)) => {
                     debug!("got empty queue");
-                    if self.account_entropy_pool.is_none() {
-                        debug!(
-                            "device does not have the needed keys; requesting from primary device"
-                        );
-
-                        let mut message_sender = self.message_sender.clone();
-                        tokio::task::spawn_local(async move {
-                            let result = message_sender
-                                .send_sync_message(SyncMessage {
-                                    content: Some(SyncContent::Request(sync_message::Request {
-                                        r#type: Some(sync_message::request::Type::Keys.into()),
-                                    })),
-                                    ..SyncMessage::with_padding(&mut rand::rng())
-                                })
-                                .await;
-
-                            if let Err(error) = result {
-                                warn!(%error, "Error requesting keys from the primary device");
-                            }
-                        });
+                    match self.store.fetch_account_entropy_pool().await {
+                        Ok(None) => {
+                            debug!("device does not have the needed keys; requesting from primary device");
+                            self.enqueue(Job::RequestKeys).await;
+                        }
+                        Ok(Some(_)) => {}
+                        Err(error) => error!(%error, "failed to read the account entropy pool"),
                     }
                     return Some(Received::QueueEmpty);
                 }
@@ -387,8 +412,8 @@ where
                 return None;
             }
             (Origin::Own, ContentBody::SynchronizeMessage(sync)) => {
-                if let Some(received) = self.handle_sync(OwnSync(sync)).await {
-                    return Some(received);
+                if self.handle_sync(OwnSync(sync)).await {
+                    return None;
                 }
             }
             (Origin::Own | Origin::Peer, _) => {}
@@ -398,111 +423,84 @@ where
     }
 
     /// What only our own devices may ask: answers, the account's contacts, keys and sticker
-    /// packs. Returns what to tell when the message is nothing more than that.
-    async fn handle_sync(&mut self, OwnSync(sync): OwnSync<'_>) -> Option<Received> {
-        if let Some(SyncContent::Request(request)) = &sync.content {
-            self.answer(request.r#type()).await;
-        }
-
-        // contacts synchronization sent from the primary device (happens after linking, or on demand)
-        if let Some(SyncContent::Contacts(contacts)) = &sync.content {
-            match self.message_receiver.retrieve_contacts(contacts).await {
-                Ok(contacts) => {
-                    info!("saving contacts");
-                    for contact in contacts.filter_map(Result::ok) {
-                        if let Err(error) = self.store.save_contact(&contact.into()).await {
-                            warn!(%error, "failed to save contacts");
-                            break;
-                        }
-                    }
+    /// packs. Whether the message is nothing more than that.
+    async fn handle_sync(&mut self, OwnSync(sync): OwnSync<'_>) -> bool {
+        match &sync.content {
+            Some(SyncContent::Request(request)) => match request.r#type() {
+                RequestType::Contacts => self.enqueue(Job::AnswerContacts).await,
+                RequestType::Keys => self.enqueue(Job::AnswerKeys).await,
+                // No block list is stored, and an empty answer would clear the requester's.
+                RequestType::Blocked => {
+                    warn!("not answering a request for the block list: none is stored");
                 }
-                Err(error) => {
-                    warn!(%error, "failed to retrieve contacts");
-                }
-            }
-
-            return Some(Received::Contacts);
-        }
-
-        // sticker pack operations
-        {
-            for operation in &sync.sticker_pack_operation {
-                match operation.r#type() {
-                    sticker_pack_operation::Type::Install => {
-                        let store = self.store.clone();
-                        let unidentified_websocket = self.unidentified_websocket.clone();
-                        let operation = operation.clone();
-                        let stored = self.stored_packs_sender.clone();
-
-                        // download stickers in the background
-                        tokio::spawn(async move {
-                            match download_sticker_pack(store, unidentified_websocket, &operation)
-                                .await
-                            {
-                                Ok(sticker_pack) => {
-                                    debug!(
-                                        "downloaded sticker pack: {} made by {}",
-                                        sticker_pack.manifest.title, sticker_pack.manifest.author
-                                    );
-                                    // Fails only once the stream is gone.
-                                    let _ = stored.unbounded_send(operation.pack_id().to_vec());
-                                }
-                                Err(error) => error!(%error, "failed to download sticker pack"),
-                            }
-                        });
-                    }
-                    sticker_pack_operation::Type::Remove => {
-                        match self.store.remove_sticker_pack(operation.pack_id()).await {
-                            Ok(was_present) => debug!(was_present, "removed stick pack"),
-                            Err(error) => error!(%error, "failed to remove sticker pack"),
-                        }
-                    }
-                }
-            }
-        }
-
-        // key synchronization sent from the primary device
-        if let Some(SyncContent::Keys(keys)) = &sync.content {
-            debug!("received key sync message");
-            if self.registration_type == RegistrationType::Primary {
-                warn!("received a key sync message as a primary device; ignoring")
-            } else {
-                match keys
-                    .account_entropy_pool
-                    .as_ref()
-                    .map(|s| AccountEntropyPool::from_str(s))
-                {
-                    Some(Ok(aep)) => {
-                        if let Err(error) = self.store.store_account_entropy_pool(Some(&aep)).await
-                        {
-                            error!(%error, "failed to store account entropy pool");
-                        }
-                        self.account_entropy_pool = Some(aep);
-                    }
-                    Some(Err(error)) => {
-                        warn!(%error, "cannot convert account entropy pool from string")
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        // The primary device told us to fetch stuff again from the storage service.
-        if let Some(SyncContent::FetchLatest(fetch_latest)) = &sync.content {
-            if fetch_latest.r#type() == sync_message::fetch_latest::Type::StorageManifest {
-                if let Err(error) = sync_groups_from_storage_service(
-                    &self.store,
+                t => info!(type = ?t, "Got sync request of currently unhandled type"),
+            },
+            // contacts synchronization sent from the primary device (happens after linking, or on demand)
+            Some(SyncContent::Contacts(contacts)) => {
+                info!("saving contacts");
+                let saved = jobs::save_contacts(
+                    &mut self.store,
                     self.identified_push_service.clone(),
-                    &mut self.groups_manager,
+                    contacts,
                 )
-                .await
-                {
-                    warn!(%error, "failed to sync groups from the storage service");
+                .await;
+                return match saved {
+                    Ok(()) => {
+                        self.pending.push_back(Received::Contacts);
+                        true
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to save contacts; trying again later");
+                        self.enqueue(Job::SaveContacts {
+                            contacts: contacts.encode_to_vec(),
+                        })
+                        .await;
+                        true
+                    }
+                };
+            }
+            // key synchronization sent from the primary device
+            Some(SyncContent::Keys(keys)) => {
+                debug!("received key sync message");
+                if self.registration_type == RegistrationType::Primary {
+                    warn!("received a key sync message as a primary device; ignoring")
+                } else if let Some(pool) = jobs::pool_of(keys) {
+                    if let Err(error) = self.store.store_account_entropy_pool(Some(&pool)).await {
+                        error!(%error, "failed to store account entropy pool");
+                    }
+                }
+            }
+            // The primary device told us to fetch stuff again from the storage service.
+            Some(SyncContent::FetchLatest(fetch_latest))
+                if fetch_latest.r#type() == sync_message::fetch_latest::Type::StorageManifest =>
+            {
+                self.enqueue(Job::SyncStorage).await;
+            }
+            _ => {}
+        }
+
+        for operation in &sync.sticker_pack_operation {
+            match operation.r#type() {
+                sticker_pack_operation::Type::Install => {
+                    self.enqueue(Job::InstallStickerPack {
+                        pack_id: operation.pack_id().to_vec(),
+                        pack_key: operation.pack_key().to_vec(),
+                    })
+                    .await;
+                }
+                sticker_pack_operation::Type::Remove => {
+                    match self.store.remove_sticker_pack(operation.pack_id()).await {
+                        Ok(was_present) => debug!(was_present, "removed stick pack"),
+                        Err(error) => error!(%error, "failed to remove sticker pack"),
+                    }
                 }
             }
         }
+        false
+    }
 
-        None
+    async fn enqueue(&mut self, job: Job) {
+        jobs::enqueue(&mut self.store, &self.jobs_wake, job).await;
     }
 
     /// Keeps a message from a peer or from one of our devices, its group brought up to date first.
@@ -562,104 +560,30 @@ where
                         });
                     }
                 }
-                Err(error) => warn!(%error, "failed to update the group"),
+                Err(error) => {
+                    warn!(%error, "failed to update the group; trying again later");
+                    if let Ok(master_key) = <[u8; 32]>::try_from(master_key_bytes.as_slice()) {
+                        self.enqueue(Job::UpdateGroup {
+                            master_key,
+                            revision: *revision,
+                        })
+                        .await;
+                    }
+                }
             }
         }
 
-        let kept = save_message(
-            &mut self.store,
-            &mut self.identified_websocket,
-            &content,
-            None,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            error!(%error, "error saving message to store");
-            Kept::NotStored
-        });
+        let kept = save_message(&mut self.store, &self.jobs_wake, &content, None)
+            .await
+            .unwrap_or_else(|error| {
+                error!(%error, "error saving message to store");
+                Kept::NotStored
+            });
 
         Some(Received::Content {
             content: Box::new(content),
             kept,
         })
-    }
-
-    /// Answers another device's sync request, in the background: the send needs this stream
-    /// polled to go out.
-    async fn answer(&self, request: RequestType) {
-        let mut message_sender = self.message_sender.clone();
-        match request {
-            RequestType::Contacts => {
-                // All of them or no answer: the answer is complete, and replaces what they have.
-                let contacts = match self.store.contacts().await {
-                    Ok(contacts) => contacts.collect::<Result<Vec<_>, _>>(),
-                    Err(error) => Err(error),
-                };
-                let contacts = match contacts {
-                    Ok(contacts) => contacts,
-                    Err(error) => {
-                        warn!(%error, "not answering a contacts request: failed to read them");
-                        return;
-                    }
-                };
-                let aci = self.service_ids.aci();
-                tokio::task::spawn_local(async move {
-                    let result = message_sender
-                        .send_contact_details(
-                            &ServiceId::Aci(aci),
-                            None,
-                            contacts.into_iter().map(|c| ContactDetails {
-                                number: c.phone_number.map(|p| p.to_string()),
-                                aci: Some(c.uuid.to_string()),
-                                aci_binary: Some(c.uuid.into_bytes().into()),
-                                name: Some(c.name),
-                                avatar: c.avatar.map(|a| contact_details::Avatar {
-                                    content_type: Some(a.content_type),
-                                    length: a.reader.len().try_into().ok(),
-                                }),
-                                expire_timer: Some(c.expire_timer),
-                                expire_timer_version: Some(c.expire_timer_version),
-                                inbox_position: None,
-                            }),
-                            false,
-                            true,
-                        )
-                        .await;
-
-                    if let Err(error) = result {
-                        warn!(%error, "Error sending contact details to other devices");
-                    }
-                });
-            }
-            RequestType::Keys => {
-                let account_entropy_pool = self
-                    .account_entropy_pool
-                    .as_ref()
-                    .map(|aep| aep.to_string());
-                tokio::task::spawn_local(async move {
-                    let result = message_sender
-                        .send_sync_message(SyncMessage {
-                            content: Some(SyncContent::Keys(sync_message::Keys {
-                                account_entropy_pool,
-                                media_root_backup_key: None,
-                            })),
-                            ..SyncMessage::with_padding(&mut rand::rng())
-                        })
-                        .await;
-
-                    if let Err(error) = result {
-                        warn!(%error, "Error sending keys to other devices");
-                    }
-                });
-            }
-            // No block list is stored, and an empty answer would clear the requester's.
-            RequestType::Blocked => {
-                warn!("not answering a request for the block list: none is stored");
-            }
-            t => {
-                info!(type = ?t, "Got sync request of currently unhandled type")
-            }
-        }
     }
 }
 

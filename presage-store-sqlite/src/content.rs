@@ -12,6 +12,7 @@ use presage::{
     model::{
         contacts::Contact,
         groups::{Group, GroupSenderKey, SharedDevice},
+        jobs::{Job, QueuedJob},
     },
     proto::{Verified, verified},
     store::{ContentsStore, StickerPack, Thread},
@@ -240,6 +241,67 @@ impl ContentsStore for SqliteStore {
         .fetch_one(&self.db)
         .await?;
         u64::try_from(id).map_err(|_| SqliteStoreError::InvalidFormat)
+    }
+
+    async fn enqueue_job(&mut self, job: &Job) -> Result<(), Self::ContentsStoreError> {
+        let key = job.key();
+        let job = serde_json::to_string(job)?;
+        query!(
+            "INSERT INTO jobs (key, job) VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET job = excluded.job, attempts = 0, due_at = 0",
+            key,
+            job,
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn jobs(&self) -> Result<Vec<QueuedJob>, Self::ContentsStoreError> {
+        let rows = query!(
+            r#"SELECT id AS "id!: i64", job, attempts AS "attempts: u32", due_at AS "due_at: u64"
+            FROM jobs ORDER BY id"#
+        )
+        .fetch_all(&self.db)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(QueuedJob {
+                    id: u64::try_from(row.id).map_err(|_| SqliteStoreError::InvalidFormat)?,
+                    job: serde_json::from_str(&row.job)?,
+                    attempts: row.attempts,
+                    due_at: row.due_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn finish_job(&mut self, job: &QueuedJob) -> Result<(), Self::ContentsStoreError> {
+        let id = job.id as i64;
+        let job = serde_json::to_string(&job.job)?;
+        query!("DELETE FROM jobs WHERE id = ? AND job = ?", id, job)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn retry_job(
+        &mut self,
+        job: &QueuedJob,
+        due_at: u64,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let id = job.id as i64;
+        let due_at = due_at as i64;
+        let job = serde_json::to_string(&job.job)?;
+        query!(
+            "UPDATE jobs SET attempts = attempts + 1, due_at = ? WHERE id = ? AND job = ?",
+            due_at,
+            id,
+            job,
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     async fn decrypted(&self) -> Result<Vec<(u64, Content)>, Self::ContentsStoreError> {
@@ -1184,6 +1246,53 @@ mod test {
             Some(Some(2_000))
         );
         assert!(found(3_000).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_waits_until_finished() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        store.enqueue_job(&Job::AnswerKeys).await?;
+        store.enqueue_job(&Job::SyncStorage).await?;
+
+        let jobs = store.jobs().await?;
+        assert_eq!(
+            jobs.iter().map(|queued| &queued.job).collect::<Vec<_>>(),
+            [&Job::AnswerKeys, &Job::SyncStorage]
+        );
+
+        store.retry_job(&jobs[0], 5_000).await?;
+        let retried = &store.jobs().await?[0];
+        assert_eq!((retried.attempts, retried.due_at), (1, 5_000));
+
+        store.finish_job(&jobs[0]).await?;
+        assert_eq!(store.jobs().await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_queued_again_takes_the_place_of_the_one_waiting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let fetch = |profile_key| Job::FetchProfile {
+            aci: [1; 16],
+            profile_key,
+            expire_timer: 0,
+            expire_timer_version: 1,
+        };
+        store.enqueue_job(&fetch([2; 32])).await?;
+        let running = store.jobs().await?.remove(0);
+        store.retry_job(&running, 5_000).await?;
+
+        store.enqueue_job(&fetch([3; 32])).await?;
+        let jobs = store.jobs().await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job, fetch([3; 32]));
+        assert_eq!((jobs[0].attempts, jobs[0].due_at), (0, 0));
+
+        // The one that ran meanwhile doesn't take the new one with it.
+        store.finish_job(&running).await?;
+        assert_eq!(store.jobs().await?.len(), 1);
         Ok(())
     }
 }

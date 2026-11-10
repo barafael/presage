@@ -637,6 +637,9 @@ async fn receive<S: Store>(
                     message.timestamp
                 )
             }
+            Received::ContactSaved { service_id } => {
+                println!("saved contact {}", service_id.service_id_string());
+            }
             Received::StickerPackInstalled { pack_id } => {
                 println!("installed sticker pack {}", hex::encode(pack_id))
             }
@@ -1010,8 +1013,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     Received::RetryReceipt { .. } => {
                         println!("a contact failed to decrypt a message of ours")
                     }
-                    Received::StickerPackInstalled { .. } | Received::MissedGroupChanges { .. } => {
-                    }
+                    Received::ContactSaved { .. }
+                    | Received::StickerPackInstalled { .. }
+                    | Received::MissedGroupChanges { .. } => {}
                 }
             }
         }

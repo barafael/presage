@@ -188,7 +188,9 @@ impl<S: Store> Manager<S, Registered> {
                 revision,
                 Some(&signed),
             )
-            .await?;
+            .await
+            .inspect_err(|error| warn!(%error, "failed to store the group as changed"))
+            .ok();
         }
         if let GroupEdit::Avatar(avatar) = &change {
             self.store.save_group_avatar(*master_key, avatar).await?;
@@ -904,7 +906,7 @@ pub(super) async fn update_group<S: Store>(
         }
     };
     let Some(mut group) = stored else {
-        fetch_group_whole(store, groups_manager, master_key, None).await;
+        fetch_group_whole(store, groups_manager, master_key, None).await?;
         return Ok(Vec::new());
     };
     debug!(group_name =% group.title, "loaded group from local db");
@@ -965,35 +967,42 @@ pub(super) async fn update_group<S: Store>(
         }
         Err(error) => {
             warn!(error = %Causes(&error), "failed to read the group's changes; fetching it whole");
-            fetch_group_whole(store, groups_manager, master_key, Some(avatar)).await;
+            fetch_group_whole(store, groups_manager, master_key, Some(avatar)).await?;
             Ok(Vec::new())
         }
     }
 }
 
-/// [`fetch_group`], once more if the connection failed: nothing fetches the group again until
-/// its next message, and until then it stays as it was (a member who left, still listed). Not
-/// if the server answered: a refusal (we aren't a member) would be the same again.
+/// [`fetch_group`], once more if the connection failed. Fails only if it failed again: the
+/// group stays as it was (a member who left, still listed) until it is fetched, which a
+/// [`Job`](crate::model::jobs::Job) then does. Not if the server answered: a refusal (we aren't
+/// a member) would be the same again.
 async fn fetch_group_whole<S: Store>(
     store: &S,
     groups_manager: &mut GroupsManager<GroupCredentialsCache>,
     master_key: [u8; 32],
     avatar_path: Option<String>,
-) {
+) -> Result<(), Error<S::Error>> {
     debug!("fetching and saving group");
+    let connection_failed = |fetched: &Result<_, Error<S::Error>>| {
+        fetched
+            .as_ref()
+            .is_err_and(|error| matches!(error, Error::ServiceError(error) if transient(error)))
+    };
     let mut fetched = fetch_group(store, groups_manager, master_key, avatar_path.clone()).await;
-    if fetched
-        .as_ref()
-        .is_err_and(|error| matches!(error, Error::ServiceError(error) if transient(error)))
-    {
+    if connection_failed(&fetched) {
         if let Err(error) = &fetched {
             warn!(error = %Causes(error), "failed to fetch encrypted group, fetching it again");
         }
         fetched = fetch_group(store, groups_manager, master_key, avatar_path).await;
     }
+    if connection_failed(&fetched) {
+        return fetched.map(drop);
+    }
     if let Err(error) = fetched {
         warn!(error = %Causes(&error), "failed to fetch encrypted group");
     }
+    Ok(())
 }
 
 /// A random (version 4) UUID, as Signal's apps make a distribution id.

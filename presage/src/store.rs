@@ -29,6 +29,7 @@ use crate::{
     model::{
         contacts::Contact,
         groups::{Group, GroupSenderKey, SharedDevice},
+        jobs::{Job, QueuedJob},
     },
     AvatarBytes,
 };
@@ -191,6 +192,30 @@ pub trait ContentsStore: Send + Sync {
 
     /// Forgets the decrypted content `id`, now handled.
     fn handled(&mut self, id: u64) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
+
+    /// Queues `job` until it is [finished](ContentsStore::finish_job), due at once. One job
+    /// waits per [key](Job::key): this one takes the place of one waiting with the same.
+    fn enqueue_job(
+        &mut self,
+        job: &Job,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send;
+
+    /// The jobs queued, oldest first.
+    fn jobs(&self) -> impl Future<Output = Result<Vec<QueuedJob>, Self::ContentsStoreError>>;
+
+    /// Forgets `job`, done or given up, unless another took its place meanwhile.
+    fn finish_job(
+        &mut self,
+        job: &QueuedJob,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
+
+    /// Notes that `job` failed once more, to be tried again at `due_at` (milliseconds since
+    /// the epoch).
+    fn retry_job(
+        &mut self,
+        job: &QueuedJob,
+        due_at: u64,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     /// Retrieve a message [Thread] from its sender and timestamp.
     fn thread_for_sender_and_timestamp(

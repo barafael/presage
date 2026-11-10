@@ -16,7 +16,8 @@ pub use self::confirmation::Confirmation;
 pub use self::keep::{keep, Kept};
 pub use self::linking::Linking;
 pub use self::registered::{
-    GroupEdit, GroupJoin, Registered, RegistrationData, RegistrationType, Services, TransferArchive,
+    GroupEdit, GroupJoin, Messages, Registered, RegistrationData, RegistrationType, Services,
+    TransferArchive,
 };
 pub use self::registration::{Registration, RegistrationOptions};
 pub use self::settings::Settings;

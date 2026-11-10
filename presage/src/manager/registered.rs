@@ -53,16 +53,19 @@ use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 mod groups;
+mod jobs;
 mod receive;
 
 use self::groups::update_group;
 pub use self::groups::{GroupEdit, GroupJoin};
+pub use self::receive::Messages;
 
 use super::account_keys::AccountKeys;
 use super::group_credentials::{GroupCredentialsCache, SharedGroupCredentials};
 use super::keep::{keep, Kept};
 use super::settings::{Settings, SharedSettings};
 use crate::model::contacts::Contact;
+use crate::model::jobs::Job;
 use crate::model::previews;
 use crate::serde::serde_profile_key;
 use crate::store::{ContentsStore, Sticker, StickerPack, StickerPackManifest, Store, Thread};
@@ -93,6 +96,9 @@ pub struct Registered {
     /// Shared by every cipher and sender of this account, and by its clones.
     pub(crate) session_lock: SessionLock,
 
+    /// Wakes the job runner of whichever clone receives.
+    pub(crate) jobs_wake: Arc<tokio::sync::Notify>,
+
     /// The account's group credentials, which every groups manager made shares.
     pub(crate) group_credentials: SharedGroupCredentials,
 
@@ -116,6 +122,7 @@ impl Registered {
             link_preview_client: Default::default(),
             settings: Default::default(),
             session_lock: Default::default(),
+            jobs_wake: Default::default(),
             group_credentials: Default::default(),
             data: Arc::new(data),
         }
@@ -852,10 +859,9 @@ impl<S: Store> Manager<S, Registered> {
             body: content_body,
         };
 
-        let mut identified_websocket = self.identified_websocket(false).await?;
         save_message(
             &mut self.store,
-            &mut identified_websocket,
+            &self.state.jobs_wake,
             &content,
             Some(thread),
         )
@@ -1093,10 +1099,9 @@ impl<S: Store> Manager<S, Registered> {
             body: content_body,
         };
 
-        let mut identified_websocket = self.identified_websocket(false).await?;
         save_message(
             &mut self.store,
-            &mut identified_websocket,
+            &self.state.jobs_wake,
             &content,
             Some(thread),
         )
@@ -1351,8 +1356,7 @@ impl<S: Store> Manager<S, Registered> {
             body: ContentBody::SynchronizeMessage(sync_message),
         };
 
-        let mut identified_websocket = self.identified_websocket(false).await?;
-        save_message(&mut self.store, &mut identified_websocket, &content, None).await?;
+        save_message(&mut self.store, &self.state.jobs_wake, &content, None).await?;
         Ok(content)
     }
 
@@ -1730,7 +1734,11 @@ async fn upsert_group<S: Store>(
     master_key_bytes: &[u8],
     revision: &u32,
 ) -> Result<Option<Group>, Error<S::Error>> {
-    update_group(store, groups_manager, master_key_bytes, *revision, None).await?;
+    // The stored group will do when the connection fails.
+    if let Err(error) = update_group(store, groups_manager, master_key_bytes, *revision, None).await
+    {
+        warn!(%error, "failed to bring the group up to date");
+    }
     Ok(store.group(master_key_bytes.try_into()?).await?)
 }
 
@@ -1810,11 +1818,11 @@ async fn download_sticker<C: ContentsStore>(
 }
 
 /// Keeps `message` as [`keep`] does, its sender's profile key first: sending to them by sealed
-/// sender needs it. A new sender, or one with a new key, gets their profile fetched in the
-/// background.
+/// sender needs it. A new sender, or one with a new key, gets their profile fetched by a
+/// [`Job`].
 async fn save_message<S: Store>(
     store: &mut S,
-    identified_websocket: &mut websocket::SignalWebSocket<websocket::Identified>,
+    jobs_wake: &tokio::sync::Notify,
     message: &Content,
     override_thread: Option<Thread>,
 ) -> Result<Kept, Error<S::Error>> {
@@ -1835,7 +1843,7 @@ async fn save_message<S: Store>(
         if let Some(profile_key_bytes) = data_message
             .profile_key
             .clone()
-            .and_then(|p| p.try_into().ok())
+            .and_then(|p| <[u8; 32]>::try_from(p).ok())
         {
             let sender = message.metadata.sender;
             let profile_key = ProfileKey::create(profile_key_bytes);
@@ -1844,76 +1852,76 @@ async fn save_message<S: Store>(
                 .await?
                 .is_none_or(|known| known.bytes != profile_key.bytes);
 
-            if let (true, Some(aci)) = (changed, sender.aci()) {
-                debug!(sender = %sender.service_id_string(), "inserting profile key for");
-                store.upsert_profile_key(&aci.into(), profile_key).await?;
-            }
-
-            if changed || store.contact_by_id(&sender).await?.is_none() {
-                let store_inner = store.clone();
-                let websocket_inner = identified_websocket.clone();
-                let data_message_inner = data_message.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = upsert_contact_from_profile(
-                        store_inner,
-                        websocket_inner,
-                        &data_message_inner,
-                        sender,
-                        profile_key,
-                    )
-                    .await
-                    {
-                        error!(%error, "failed to upsert newly seen contact!");
-                    }
-                });
+            if let Some(aci) = sender.aci() {
+                if changed {
+                    debug!(sender = %sender.service_id_string(), "inserting profile key for");
+                    store.upsert_profile_key(&aci.into(), profile_key).await?;
+                }
+                if changed || store.contact_by_id(&sender).await?.is_none() {
+                    let job = Job::FetchProfile {
+                        aci: Uuid::from(aci).into_bytes(),
+                        profile_key: profile_key_bytes,
+                        expire_timer: data_message.expire_timer.unwrap_or_default(),
+                        expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+                    };
+                    jobs::enqueue(store, jobs_wake, job).await;
+                }
             }
         }
     }
     keep(store, message, Some(thread)).await
 }
 
+/// Fetches the profile of `aci` and saves them as a contact by its name.
 async fn upsert_contact_from_profile<S: Store>(
     mut store: S,
     mut identified_websocket: SignalWebSocket<websocket::Identified>,
-    data_message: &DataMessage,
-    sender: ServiceId,
+    aci: Aci,
     profile_key: ProfileKey,
+    expire_timer: u32,
+    expire_timer_version: u32,
 ) -> Result<(), Error<<S as Store>::Error>> {
-    if let Some(aci) = sender.aci() {
-        let sender_uuid: Uuid = aci.into();
-        let encrypted_profile = identified_websocket
-            .retrieve_profile_by_id(aci, Some(profile_key))
-            .await?;
-        let profile_cipher = ProfileCipher::new(profile_key);
-        let decrypted_profile = profile_cipher.decrypt(encrypted_profile)?;
+    let sender_uuid: Uuid = aci.into();
+    let encrypted_profile = identified_websocket
+        .retrieve_profile_by_id(aci, Some(profile_key))
+        .await?;
+    let profile_cipher = ProfileCipher::new(profile_key);
+    let decrypted_profile = profile_cipher.decrypt(encrypted_profile)?;
 
-        let contact = Contact {
+    // What a contacts sync or the client saved of them stays; the name is the profile's.
+    let known = store.contact_by_id(&aci.into()).await?;
+    let name = decrypted_profile
+        .name
+        // FIXME: this assumes [firstname] [lastname]
+        .map(|pn| {
+            if let Some(family_name) = pn.family_name {
+                format!("{} {}", pn.given_name, family_name)
+            } else {
+                pn.given_name
+            }
+        })
+        .unwrap_or_default();
+    let contact = match known {
+        Some(known) => Contact {
+            name,
+            profile_key: profile_key.bytes.to_vec(),
+            ..known
+        },
+        None => Contact {
             uuid: sender_uuid,
             phone_number: None,
-            name: decrypted_profile
-                .name
-                // FIXME: this assumes [firstname] [lastname]
-                .map(|pn| {
-                    if let Some(family_name) = pn.family_name {
-                        format!("{} {}", pn.given_name, family_name)
-                    } else {
-                        pn.given_name
-                    }
-                })
-                .unwrap_or_default(),
+            name,
             profile_key: profile_key.bytes.to_vec(),
-            expire_timer: data_message.expire_timer.unwrap_or_default(),
-            expire_timer_version: data_message.expire_timer_version.unwrap_or(1),
+            expire_timer,
+            expire_timer_version,
             inbox_position: 0,
             avatar: None,
             verified: Verified::default(),
-        };
+        },
+    };
 
-        info!(%sender_uuid, "saved contact on first sight");
-        store.save_contact(&contact).await?;
-    } else {
-        debug!("not storing profile for PNI contact");
-    }
+    info!(%sender_uuid, "saved contact from their profile");
+    store.save_contact(&contact).await?;
     Ok(())
 }
 

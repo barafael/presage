@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO jobs (key, job) VALUES (?, ?)\n            ON CONFLICT (key) DO UPDATE SET job = excluded.job, attempts = 0, due_at = 0",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "50c8ae24bd1536c510826ed952d8534943119384dc8cd68c459538fe0b612042"
+}

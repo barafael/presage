@@ -501,20 +501,27 @@ impl<S: Store> Manager<S, Registered> {
             .await
             .ok()
             .flatten();
-        if let Some(profile) = &cached {
+        if let Some(profile) = cached {
             let replica = Replica::Profile(aci.into());
             let freshness = self.store.replica(&replica).await.ok().flatten();
             if !stale(&replica, freshness, replicas::now()) {
-                return Ok(profile.clone());
+                return Ok(profile);
             }
         }
-        match (self.refresh_profile(aci, profile_key).await, cached) {
-            (Ok(profile), _) => Ok(profile),
-            (Err(error), Some(cached)) => {
-                warn!(%error, "failed to fetch a profile again; the stored one will do");
-                Ok(cached)
+        match self.refresh_profile(aci, profile_key).await {
+            Ok(profile) => Ok(profile),
+            Err(error) => {
+                // Stored before, or just now without its picture, if that alone failed.
+                let stored = self.store.profile(aci.into(), profile_key).await;
+                let Some(stored) = stored.ok().flatten() else {
+                    return Err(error);
+                };
+                warn!(%error, "failed to fetch a profile; the stored one will do");
+                // As current as it gets for now: asked for again only when any other would be.
+                let replica = Replica::Profile(aci.into());
+                let _ = self.store.set_replica(&replica, Freshness::now(None)).await;
+                Ok(stored)
             }
-            (Err(error), None) => Err(error),
         }
     }
 
@@ -720,7 +727,9 @@ impl<S: Store> Manager<S, Registered> {
     }
 
     /// See [`sync_groups_from_storage_service`].
-    pub(super) async fn sync_groups_from_storage_service(&self) -> Result<(), Error<S::Error>> {
+    pub(super) async fn sync_groups_from_storage_service(
+        &self,
+    ) -> Result<Option<u64>, Error<S::Error>> {
         let mut groups_manager = Box::pin(self.groups_manager()).await?;
         sync_groups_from_storage_service(
             &self.store,
@@ -1658,11 +1667,13 @@ fn ensure_data_message_timestamp(content_body: &mut ContentBody, timestamp: u64)
     }
 }
 
+/// Fetches the groups the storage service lists and the store doesn't have. Returns the version
+/// of the manifest read, `None` if it hadn't changed since it was last read in full.
 async fn sync_groups_from_storage_service<S: Store>(
     store: &S,
     push_service: PushService,
     groups_manager: &mut GroupsManager<GroupCredentialsCache>,
-) -> Result<(), Error<S::Error>> {
+) -> Result<Option<u64>, Error<S::Error>> {
     const READ_CHUNK: usize = 100;
 
     let keys = AccountKeys::load(store)
@@ -1678,12 +1689,12 @@ async fn sync_groups_from_storage_service<S: Store>(
             Some(manifest) => manifest,
             None => {
                 debug!(version, "the storage manifest is unchanged");
-                return Ok(());
+                return Ok(None);
             }
         },
         None => storage.manifest().await?,
     };
-    let mut complete = true;
+    let mut failed = None;
     let group_ids: Vec<Vec<u8>> = manifest
         .identifiers
         .iter()
@@ -1703,7 +1714,7 @@ async fn sync_groups_from_storage_service<S: Store>(
             Ok(records) => records,
             Err(error) => {
                 warn!(%error, "failed to read group records from the storage service");
-                complete = false;
+                failed = Some(error.into());
                 continue;
             }
         };
@@ -1714,16 +1725,17 @@ async fn sync_groups_from_storage_service<S: Store>(
             if let Err(error) = save_unknown_group(store, groups_manager, &record.master_key).await
             {
                 warn!(%error, "failed to fetch group listed in the storage service");
-                complete = false;
+                failed = Some(error);
             }
         }
     }
-    // Read again in full unless all of it was read.
-    if complete {
-        let freshness = Freshness::now(Some(manifest.version));
-        store.clone().set_replica(&replica, freshness).await?;
+    // Read again in full unless all of it was read: the failure puts the job off.
+    if let Some(error) = failed {
+        return Err(error);
     }
-    Ok(())
+    let freshness = Freshness::now(Some(manifest.version));
+    store.clone().set_replica(&replica, freshness).await?;
+    Ok(Some(manifest.version))
 }
 
 /// Incoming messages keep known groups current, so only unknown ones are fetched.

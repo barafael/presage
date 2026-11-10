@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO groups (master_key, title, revision, invite_link_password,\n                    access_control, avatar, description, members, pending_members,\n                    requesting_members, disappearing_messages_timer)\n                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n                ON CONFLICT (master_key) DO UPDATE SET\n                    title = excluded.title,\n                    revision = excluded.revision,\n                    invite_link_password = excluded.invite_link_password,\n                    access_control = excluded.access_control,\n                    avatar = excluded.avatar,\n                    description = excluded.description,\n                    members = excluded.members,\n                    pending_members = excluded.pending_members,\n                    requesting_members = excluded.requesting_members,\n                    disappearing_messages_timer = excluded.disappearing_messages_timer\n                WHERE excluded.revision >= groups.revision",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "0f57b0c30123d13573f493cd2d4a20196e8bd8e5e7d32c7878df1fbb5c546d80"
+}

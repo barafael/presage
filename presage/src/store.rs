@@ -76,6 +76,8 @@ pub trait StateStore {
     fn is_registered(&self) -> impl Future<Output = bool>;
 
     /// Clear registration data (including keys), but keep received messages, groups and contacts.
+    /// The queued jobs go too, and the storage manifest counts as never read: both are the
+    /// registration's.
     fn clear_registration(&mut self) -> impl Future<Output = Result<(), Self::StateStoreError>>;
 
     fn fetch_master_key(
@@ -118,7 +120,8 @@ pub trait ContentsStore: Send + Sync {
     // Clear all profiles
     fn clear_profiles(&mut self) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
-    // Clear all stored messages
+    // Clear all stored messages, contacts and groups, and with them the queued jobs and the
+    // note of the storage manifest read
     fn clear_contents(&mut self) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     // Messages
@@ -200,13 +203,14 @@ pub trait ContentsStore: Send + Sync {
 
     /// Queues `job` until it is [finished](ContentsStore::finish_job), due at once. One job
     /// waits per [key](Job::key): this one takes the place of a different one waiting with
-    /// the same, and leaves the same one waiting as it is.
+    /// the same ([QueuedJob::generation] counts that), and leaves the same one waiting as it is.
     fn enqueue_job(
         &mut self,
         job: &Job,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send;
 
-    /// The jobs queued, oldest first.
+    /// The jobs queued, oldest first. One that can't be read (another version queued it) is
+    /// dropped.
     fn jobs(&self) -> impl Future<Output = Result<Vec<QueuedJob>, Self::ContentsStoreError>>;
 
     /// Forgets `job`, done or given up, unless another took its place meanwhile.
@@ -216,7 +220,7 @@ pub trait ContentsStore: Send + Sync {
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
     /// Notes that `job` failed once more, to be tried again at `due_at` (milliseconds since
-    /// the epoch).
+    /// the epoch), unless another took its place meanwhile.
     fn retry_job(
         &mut self,
         job: &QueuedJob,

@@ -19,10 +19,11 @@ use libsignal_service::{
 use rand::rng;
 use tracing::{debug, error, warn};
 
-use super::{ensure_data_message_timestamp, upsert_group, MessageSender, Registered};
+use super::{ensure_data_message_timestamp, jobs, upsert_group, MessageSender, Registered};
 
 use crate::manager::group_credentials::GroupCredentialsCache;
 use crate::model::groups::{GroupSenderKey, SharedDevice};
+use crate::model::jobs::Job;
 use crate::model::messages::MissedGroupChange;
 use crate::store::{Store, Thread};
 use crate::{model::groups::Group, Error, Manager};
@@ -181,16 +182,23 @@ impl<S: Store> Manager<S, Registered> {
         } else {
             // The change the server signed is the next revision: no need to fetch the group.
             let signed = signed.encode_to_vec();
-            update_group(
+            let updated = update_group(
                 &self.store,
                 &mut groups_manager,
                 master_key,
                 revision,
                 Some(&signed),
             )
-            .await
-            .inspect_err(|error| warn!(%error, "failed to store the group as changed"))
-            .ok();
+            .await;
+            if let Err(error) = updated {
+                warn!(%error, "failed to store the group as changed; trying again later");
+                let job = Job::UpdateGroup {
+                    master_key: *master_key,
+                    revision,
+                    told: true,
+                };
+                jobs::enqueue(&mut self.store, &self.state.jobs_wake, job).await;
+            }
         }
         if let GroupEdit::Avatar(avatar) = &change {
             self.store.save_group_avatar(*master_key, avatar).await?;
@@ -944,6 +952,15 @@ pub(super) async fn update_group<S: Store>(
                 changes = entries.len(),
                 "read the group's changes from its log"
             );
+            // Updated meanwhile by another reader of the log (a job, or the receiver), who
+            // has told of these changes too.
+            let moved_on = matches!(
+                store.group(master_key).await,
+                Ok(Some(now)) if now.revision != group.revision
+            );
+            if moved_on {
+                return Ok(Vec::new());
+            }
             let latest = entries.iter().rev().find_map(|entry| entry.group.clone());
             if let Some(latest) = latest {
                 save_group(

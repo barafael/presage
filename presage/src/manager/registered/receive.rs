@@ -588,6 +588,7 @@ where
                         self.enqueue(Job::UpdateGroup {
                             master_key,
                             revision: *revision,
+                            told: group_change.is_some(),
                         })
                         .await;
                     }

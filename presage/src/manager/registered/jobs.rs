@@ -1,12 +1,13 @@
 //! Runs the [`Job`]s the store keeps, while receiving.
 
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc;
 use futures::future::{self, Either};
-use futures::{pin_mut, StreamExt};
+use futures::{pin_mut, FutureExt, StreamExt};
 use libsignal_service::libsignal_account_keys::AccountEntropyPool;
 use libsignal_service::prelude::{ProtobufMessage, Uuid};
 use libsignal_service::profile_cipher::ProfileCipher;
@@ -67,9 +68,10 @@ impl<S: Store> Manager<S, Registered> {
             Job::UpdateGroup {
                 master_key,
                 revision,
+                told,
             } => {
                 let mut groups_manager = Box::pin(self.groups_manager()).await?;
-                let changes = update_group(
+                let mut changes = update_group(
                     &self.store,
                     &mut groups_manager,
                     master_key,
@@ -77,6 +79,8 @@ impl<S: Store> Manager<S, Registered> {
                     None,
                 )
                 .await?;
+                // The message told of its own change.
+                changes.retain(|change| !*told || change.changes.version != *revision);
                 Ok(if changes.is_empty() {
                     Vec::new()
                 } else {
@@ -104,7 +108,15 @@ impl<S: Store> Manager<S, Registered> {
                 }])
             }
             Job::SyncStorage => {
-                self.sync_groups_from_storage_service().await?;
+                // Again while the manifest moves on: what tells of a change during the read
+                // queues this same job, which this run settles.
+                let mut read = None;
+                while let Some(version) = self.sync_groups_from_storage_service().await? {
+                    if read.is_some_and(|read| version <= read) {
+                        break;
+                    }
+                    read = Some(version);
+                }
                 Ok(Vec::new())
             }
             Job::SaveContacts { contacts } => {
@@ -192,7 +204,7 @@ impl<S: Store> Manager<S, Registered> {
 pub(super) async fn enqueue<S: Store>(store: &mut S, wake: &tokio::sync::Notify, job: Job) {
     match store.enqueue_job(&job).await {
         Ok(()) => wake.notify_one(),
-        Err(error) => error!(%error, ?job, "failed to queue a job"),
+        Err(error) => error!(%error, %job, "failed to queue a job"),
     }
 }
 
@@ -243,33 +255,44 @@ pub(super) async fn run<S: Store>(
     let store = manager.store.clone();
     let (finished, mut done) = mpsc::unbounded();
     let mut in_flight = HashSet::new();
-    let mut start = true;
+    // Those queued at the start, until each has run once whatever its wait.
+    let mut at_start: Option<HashSet<u64>> = None;
     loop {
         let jobs = store.jobs().await.unwrap_or_else(|error| {
             error!(%error, "failed to read the queued jobs");
             Vec::new()
         });
+        let at_start = at_start.get_or_insert_with(|| jobs.iter().map(|job| job.id).collect());
         let now_ms = now();
         let mut next_due = None;
         for job in jobs {
             if in_flight.contains(&job.id) {
                 continue;
             }
-            if !start && job.due_at > now_ms {
+            if job.due_at > now_ms && !at_start.contains(&job.id) {
                 next_due = Some(next_due.map_or(job.due_at, |due: u64| due.min(job.due_at)));
             } else if in_flight.len() < CONCURRENT {
+                at_start.remove(&job.id);
                 in_flight.insert(job.id);
                 let (manager, told, finished) = (manager.clone(), told.clone(), finished.clone());
                 tokio::task::spawn_local(async move {
                     let mut store = manager.store.clone();
-                    let result = manager.run_job(&job.job).await;
                     let id = job.id;
-                    settle(&mut store, &told, job, result).await;
+                    let run = AssertUnwindSafe(manager.run_job(&job.job)).catch_unwind();
+                    match run.await {
+                        Ok(result) => settle(&mut store, &told, job, result).await,
+                        // It would panic again: given up, and its place freed.
+                        Err(_) => {
+                            error!(job = %job.job, "job panicked; giving up");
+                            if let Err(error) = store.finish_job(&job).await {
+                                error!(%error, "failed to note a job's outcome; it runs again");
+                            }
+                        }
+                    }
                     let _ = finished.unbounded_send(id);
                 });
             }
         }
-        start = false;
 
         let sleep = async {
             match next_due {
@@ -327,7 +350,7 @@ async fn settle<S: Store>(
 ) {
     let stored = match result {
         Ok(received) => {
-            debug!(job = ?job.job, "job done");
+            debug!(job = %job.job, "job done");
             for received in received {
                 // Fails only once the stream is gone.
                 let _ = told.unbounded_send(received);
@@ -336,11 +359,11 @@ async fn settle<S: Store>(
         }
         Err(error) => match backoff(job.attempts + 1, connection_failed(&error)) {
             Some(wait) => {
-                warn!(%error, job = ?job.job, ?wait, "job failed; trying again later");
+                warn!(%error, job = %job.job, ?wait, "job failed; trying again later");
                 store.retry_job(&job, now() + wait.as_millis() as u64).await
             }
             None => {
-                error!(%error, job = ?job.job, "job failed; giving up");
+                error!(%error, job = %job.job, "job failed; giving up");
                 store.finish_job(&job).await
             }
         },

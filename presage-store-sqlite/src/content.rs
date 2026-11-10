@@ -19,6 +19,7 @@ use presage::{
     store::{ContentsStore, StickerPack, Thread},
 };
 use sqlx::{query, query_as, query_scalar, types::Json};
+use tracing::warn;
 
 use crate::{
     SqliteStore, SqliteStoreError,
@@ -83,6 +84,14 @@ impl ContentsStore for SqliteStore {
             .execute(&mut *transaction)
             .await?;
         query!("DELETE FROM sticker_packs")
+            .execute(&mut *transaction)
+            .await?;
+        // The groups the storage service lists are read again, and nothing is owed for what
+        // is gone.
+        query!("DELETE FROM replicas WHERE kind = 'storage-manifest'")
+            .execute(&mut *transaction)
+            .await?;
+        query!("DELETE FROM jobs")
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await.into_protocol_error()?;
@@ -291,7 +300,8 @@ impl ContentsStore for SqliteStore {
         let job = serde_json::to_string(job)?;
         query!(
             "INSERT INTO jobs (key, job) VALUES (?, ?)
-            ON CONFLICT (key) DO UPDATE SET job = excluded.job, attempts = 0, due_at = 0
+            ON CONFLICT (key) DO UPDATE SET
+                job = excluded.job, generation = generation + 1, attempts = 0, due_at = 0
             WHERE job <> excluded.job",
             key,
             job,
@@ -303,29 +313,47 @@ impl ContentsStore for SqliteStore {
 
     async fn jobs(&self) -> Result<Vec<QueuedJob>, Self::ContentsStoreError> {
         let rows = query!(
-            r#"SELECT id AS "id!: i64", job, attempts AS "attempts: u32", due_at AS "due_at: u64"
+            r#"SELECT
+                id AS "id!: i64",
+                job,
+                generation AS "generation: u64",
+                attempts AS "attempts: u32",
+                due_at AS "due_at: u64"
             FROM jobs ORDER BY id"#
         )
         .fetch_all(&self.db)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(QueuedJob {
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            match serde_json::from_str(&row.job) {
+                Ok(job) => jobs.push(QueuedJob {
                     id: u64::try_from(row.id).map_err(|_| SqliteStoreError::InvalidFormat)?,
-                    job: serde_json::from_str(&row.job)?,
+                    job,
+                    generation: row.generation,
                     attempts: row.attempts,
                     due_at: row.due_at,
-                })
-            })
-            .collect()
+                }),
+                // Another version's: dropped, lest the others don't run for it.
+                Err(error) => {
+                    warn!(%error, id = row.id, "dropping a queued job that doesn't read");
+                    query!("DELETE FROM jobs WHERE id = ?", row.id)
+                        .execute(&self.db)
+                        .await?;
+                }
+            }
+        }
+        Ok(jobs)
     }
 
     async fn finish_job(&mut self, job: &QueuedJob) -> Result<(), Self::ContentsStoreError> {
-        let id = job.id as i64;
-        let job = serde_json::to_string(&job.job)?;
-        query!("DELETE FROM jobs WHERE id = ? AND job = ?", id, job)
-            .execute(&self.db)
-            .await?;
+        let (id, generation) = (job.id as i64, job.generation as i64);
+        query!(
+            "DELETE FROM jobs WHERE id = ? AND generation = ?",
+            id,
+            generation
+        )
+        .execute(&self.db)
+        .await?;
         Ok(())
     }
 
@@ -334,14 +362,14 @@ impl ContentsStore for SqliteStore {
         job: &QueuedJob,
         due_at: u64,
     ) -> Result<(), Self::ContentsStoreError> {
-        let id = job.id as i64;
+        let (id, generation) = (job.id as i64, job.generation as i64);
         let due_at = due_at as i64;
-        let job = serde_json::to_string(&job.job)?;
         query!(
-            "UPDATE jobs SET attempts = attempts + 1, due_at = ? WHERE id = ? AND job = ?",
+            "UPDATE jobs SET attempts = attempts + 1, due_at = ?
+            WHERE id = ? AND generation = ?",
             due_at,
             id,
-            job,
+            generation,
         )
         .execute(&self.db)
         .await?;
@@ -702,7 +730,23 @@ impl ContentsStore for SqliteStore {
         let master_key = g.master_key.as_ref();
         let mut transaction = self.begin_write().await?;
         query!(
-            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            // An older revision never takes a newer one's place: two may update a group at once.
+            "INSERT INTO groups (master_key, title, revision, invite_link_password,
+                    access_control, avatar, description, members, pending_members,
+                    requesting_members, disappearing_messages_timer)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (master_key) DO UPDATE SET
+                    title = excluded.title,
+                    revision = excluded.revision,
+                    invite_link_password = excluded.invite_link_password,
+                    access_control = excluded.access_control,
+                    avatar = excluded.avatar,
+                    description = excluded.description,
+                    members = excluded.members,
+                    pending_members = excluded.pending_members,
+                    requesting_members = excluded.requesting_members,
+                    disappearing_messages_timer = excluded.disappearing_messages_timer
+                WHERE excluded.revision >= groups.revision",
             master_key,
             g.title,
             g.revision,
@@ -1197,8 +1241,20 @@ mod test {
             invite_link_password: vec![],
             description: None,
         };
-        store.save_group(master_key, group).await?;
+        store.save_group(master_key, group.clone()).await?;
         assert!(!store.is_group_left(master_key).await?);
+
+        // An older revision doesn't take its place; the same or a newer one does.
+        let titled = |title: &str, revision| Group {
+            title: title.into(),
+            revision,
+            ..group.clone()
+        };
+        store.save_group(master_key, titled("newer", 3)).await?;
+        store.save_group(master_key, titled("older", 2)).await?;
+        assert_eq!(store.group(master_key).await?.unwrap().title, "newer");
+        store.save_group(master_key, titled("same", 3)).await?;
+        assert_eq!(store.group(master_key).await?.unwrap().title, "same");
 
         Ok(())
     }
@@ -1440,6 +1496,100 @@ mod test {
         store.enqueue_job(&Job::SyncStorage).await?;
         let waiting = &store.jobs().await?[0];
         assert_eq!((waiting.attempts, waiting.due_at), (1, 5_000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_settles_only_the_job_it_began_with() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let fetch = |profile_key| Job::FetchProfile {
+            aci: [1; 16],
+            profile_key,
+            expire_timer: 0,
+            expire_timer_version: 1,
+        };
+        store.enqueue_job(&fetch([2; 32])).await?;
+        let running = store.jobs().await?.remove(0);
+
+        // Another took its place meanwhile, and one the same as it took that one's.
+        store.enqueue_job(&fetch([3; 32])).await?;
+        store.enqueue_job(&fetch([2; 32])).await?;
+        store.retry_job(&running, 5_000).await?;
+        store.finish_job(&running).await?;
+        let waiting = store.jobs().await?.remove(0);
+        assert_eq!(
+            (waiting.id, waiting.attempts, waiting.due_at),
+            (running.id, 0, 0)
+        );
+
+        store.finish_job(&waiting).await?;
+        assert!(store.jobs().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_written_by_another_version_is_finished_all_the_same()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        // Without `told`: not as this version writes it.
+        let queued = format!(
+            r#"{{"UpdateGroup":{{"master_key":{:?},"revision":3}}}}"#,
+            [1; 32]
+        );
+        sqlx::query("INSERT INTO jobs (key, job) VALUES ('group', ?)")
+            .bind(queued)
+            .execute(&store.db)
+            .await?;
+
+        let queued = store.jobs().await?.remove(0);
+        store.finish_job(&queued).await?;
+        assert!(store.jobs().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_that_does_not_read_is_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        sqlx::query(r#"INSERT INTO jobs (key, job) VALUES ('later', '"OfALaterVersion"')"#)
+            .execute(&store.db)
+            .await?;
+        store.enqueue_job(&Job::AnswerKeys).await?;
+
+        let jobs = store.jobs().await?;
+        assert_eq!(
+            jobs.iter().map(|queued| &queued.job).collect::<Vec<_>>(),
+            [&Job::AnswerKeys]
+        );
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+            .fetch_one(&store.db)
+            .await?;
+        assert_eq!(kept, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clearing_forgets_the_jobs_and_the_manifest_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use presage::store::StateStore;
+
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let manifest = Freshness {
+            version: Some(3),
+            fetched_at: 1_000,
+        };
+        for contents in [true, false] {
+            store.enqueue_job(&Job::SyncStorage).await?;
+            store
+                .set_replica(&Replica::StorageManifest, manifest)
+                .await?;
+            if contents {
+                store.clear_contents().await?;
+            } else {
+                store.clear_registration().await?;
+            }
+            assert!(store.jobs().await?.is_empty());
+            assert_eq!(store.replica(&Replica::StorageManifest).await?, None);
+        }
         Ok(())
     }
 

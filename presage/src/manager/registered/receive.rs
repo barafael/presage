@@ -50,24 +50,30 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// Receiving runs on a thread of its own, on the runtime this is called on, until the
     /// [`Messages`] are dropped: that thread decrypts and stores, and runs the
-    /// [jobs](crate::model::jobs::Job) the store keeps. An envelope is read once the message
-    /// before it was taken from the stream.
+    /// [jobs](crate::model::jobs::Job) the store keeps. It reads the next envelope when the
+    /// stream is asked for the next message, not before.
     pub async fn receive_messages(&mut self) -> Result<Messages, Error<S::Error>> {
         let (events, received) = tokio::sync::mpsc::channel(1);
         let (ready, started) = oneshot::channel();
+        let wanted = Arc::new(tokio::sync::Notify::new());
         let manager = self.clone();
         let runtime = tokio::runtime::Handle::current();
+        let asked = wanted.clone();
         std::thread::Builder::new()
             .name("presage-receive".into())
             .spawn(move || {
                 // The protocol stores' futures aren't `Send`: they stay on this thread.
                 let local = tokio::task::LocalSet::new();
-                runtime.block_on(local.run_until(drive(manager, ready, events)));
+                runtime.block_on(local.run_until(drive(manager, ready, events, asked)));
             })?;
         started
             .await
             .map_err(|_| Error::MessagePipeInterruptedError)??;
-        Ok(Messages { received })
+        Ok(Messages {
+            received,
+            wanted,
+            asked: false,
+        })
     }
 }
 
@@ -75,13 +81,25 @@ impl<S: Store> Manager<S, Registered> {
 #[derive(Debug)]
 pub struct Messages {
     received: tokio::sync::mpsc::Receiver<Received>,
+    /// Tells the receiving thread that the next message is waited for.
+    wanted: Arc<tokio::sync::Notify>,
+    asked: bool,
 }
 
 impl Stream for Messages {
     type Item = Received;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Received>> {
-        self.received.poll_recv(cx)
+        let next = self.received.poll_recv(cx);
+        match next {
+            Poll::Ready(_) => self.asked = false,
+            Poll::Pending if !self.asked => {
+                self.asked = true;
+                self.wanted.notify_one();
+            }
+            Poll::Pending => {}
+        }
+        next
     }
 }
 
@@ -91,6 +109,7 @@ async fn drive<S: Store>(
     mut manager: Manager<S, Registered>,
     ready: oneshot::Sender<Result<(), Error<S::Error>>>,
     events: tokio::sync::mpsc::Sender<Received>,
+    wanted: Arc<tokio::sync::Notify>,
 ) {
     let (told, background) = mpsc::unbounded();
     let (mut receiver, mut account_manager) = match Receiver::new(&mut manager, background).await {
@@ -120,12 +139,13 @@ async fn drive<S: Store>(
     tokio::task::spawn_local(jobs::run(manager, told));
 
     loop {
-        // An envelope is opened only once there is room to tell of it.
-        let Ok(permit) = events.reserve().await else {
-            return;
-        };
+        // As a stream polled would: nothing is read before the next message is asked for, so
+        // that the client sees the store as its last message left it.
         let received = {
-            let next = receiver.next();
+            let next = async {
+                wanted.notified().await;
+                receiver.next().await
+            };
             let dropped = events.closed();
             pin_mut!(next, dropped);
             match future::select(next, dropped).await {
@@ -134,9 +154,11 @@ async fn drive<S: Store>(
                 Either::Right(_) => return,
             }
         };
-        match received {
-            Some(received) => permit.send(received),
-            None => return,
+        let Some(received) = received else {
+            return;
+        };
+        if events.send(received).await.is_err() {
+            return;
         }
     }
 }
@@ -719,7 +741,41 @@ mod tests {
     use libsignal_service::protocol::{Aci, ServiceId};
     use libsignal_service::push_service::ServiceIds;
 
-    use super::Origin;
+    use super::{Messages, Origin, Received};
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The receiving thread's side of [`Messages`]: produces one message per asking.
+    #[tokio::test]
+    async fn nothing_is_read_before_the_next_message_is_asked_for() {
+        let (events, received) = tokio::sync::mpsc::channel(1);
+        let wanted = Arc::new(tokio::sync::Notify::new());
+        let read = Arc::new(AtomicUsize::new(0));
+        let mut messages = Messages {
+            received,
+            wanted: wanted.clone(),
+            asked: false,
+        };
+        let reading = read.clone();
+        tokio::spawn(async move {
+            loop {
+                wanted.notified().await;
+                reading.fetch_add(1, Ordering::SeqCst);
+                if events.send(Received::QueueEmpty).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(read.load(Ordering::SeqCst), 0, "not asked yet");
+        for asked in 1..=3 {
+            assert!(matches!(messages.next().await, Some(Received::QueueEmpty)));
+            tokio::task::yield_now().await;
+            assert_eq!(read.load(Ordering::SeqCst), asked, "one read per asking");
+        }
+    }
 
     fn content(sender: Uuid, was_plaintext: bool) -> Content {
         let sender: ServiceId = Aci::from(sender).into();

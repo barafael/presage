@@ -44,7 +44,19 @@ impl<S: Store> Manager<S, Registered> {
                 if current.is_some_and(|current| current.bytes != profile_key.bytes) {
                     return Ok(Vec::new());
                 }
-                let profile = self.refresh_profile(aci, profile_key).await?;
+                // With the profile as stored when fetching it failed midway (its picture) or
+                // altogether: the contact is saved by the name known, and the profile, still not
+                // current, is fetched again with their next message.
+                let profile = match self.refresh_profile(aci, profile_key).await {
+                    Ok(profile) => profile,
+                    Err(error) => match self.store.profile(aci.into(), profile_key).await? {
+                        Some(profile) => {
+                            warn!(%error, "failed to fetch a profile; saving the contact as known");
+                            profile
+                        }
+                        None => return Err(error),
+                    },
+                };
                 save_contact_from_profile(
                     &mut self.store,
                     aci,

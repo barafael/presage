@@ -540,15 +540,24 @@ impl<S: Store> Manager<S, Registered> {
             Some(profile_key),
         );
         let profile = account_manager.retrieve_profile(aci).await?;
+
+        let known_avatar = cached.as_ref().map(|cached| cached.avatar.clone());
+        let avatar_changed = known_avatar.as_ref() != Some(&profile.avatar);
+        let avatar = match profile.avatar.as_ref().filter(|_| avatar_changed) {
+            Some(avatar) => self.download_avatar(avatar, profile_key).await.map(Some),
+            None => Ok(None),
+        };
+        // Without its new picture the profile is stored as having the old one still, so that
+        // the next fetch finds the picture changed again.
+        let mut stored = profile.clone();
+        if avatar.is_err() {
+            stored.avatar = known_avatar.flatten();
+        }
         let _ = self
             .store
-            .save_profile(aci.into(), profile_key, profile.clone())
+            .save_profile(aci.into(), profile_key, stored)
             .await;
-
-        let avatar_changed =
-            cached.as_ref().map(|cached| cached.avatar.as_ref()) != Some(profile.avatar.as_ref());
-        if let Some(avatar) = profile.avatar.as_ref().filter(|_| avatar_changed) {
-            let avatar = self.download_avatar(avatar, profile_key).await?;
+        if let Some(avatar) = avatar? {
             let _ = self
                 .store
                 .save_profile_avatar(aci.into(), profile_key, &avatar)

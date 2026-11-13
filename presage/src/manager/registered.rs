@@ -305,6 +305,19 @@ impl<S: Store> Manager<S, Registered> {
     /// Returns the current identified websocket, or creates a new one
     ///
     /// A new one is created if the current websocket is closed, or if there is none yet.
+    /// What the server warned of when the current connection was made (`X-Signal-Alert`):
+    /// `idle-primary-device`, say, when the primary hasn't been seen for a while and the server
+    /// may remove the account's linked devices. Empty without a connection.
+    pub async fn server_alerts(&self) -> Vec<String> {
+        self.state
+            .identified_websocket
+            .lock()
+            .await
+            .as_ref()
+            .map(|ws| ws.alerts())
+            .unwrap_or_default()
+    }
+
     async fn identified_websocket(
         &self,
         require_unused: bool,

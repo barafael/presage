@@ -1431,10 +1431,11 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Returns how this client was registered, either as a primary or secondary device.
     pub fn registration_type(&self) -> RegistrationType {
-        if self.state.data.device_name.is_some() {
-            RegistrationType::Secondary
-        } else {
+        // The primary is device 1; a linked device may have no name stored.
+        if self.device_id() == *DEFAULT_DEVICE_ID {
             RegistrationType::Primary
+        } else {
+            RegistrationType::Secondary
         }
     }
 

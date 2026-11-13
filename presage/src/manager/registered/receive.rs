@@ -71,6 +71,7 @@ impl<S: Store> Manager<S, Registered> {
 
         let store_inner = self.store.clone();
         let registration_data_inner = self.registration_data().clone();
+        let registration_type = self.registration_type();
 
         // We make a task to update the account attributes and refresh pre keys as needed that will
         // only yield a value if one of the two operations fail (stop signal).
@@ -78,9 +79,13 @@ impl<S: Store> Manager<S, Registered> {
         // This is necessary because in this context, we can't do the classic tokio::spawn with a
         // oneshot::channel() or CancellationToken because of !Send constraints in the Store.
         let refresh_registration_task = async move {
-            if let Err(error) =
-                set_account_attributes(&mut account_manager, &store_inner, &registration_data_inner)
-                    .await
+            if let Err(error) = set_account_attributes(
+                &mut account_manager,
+                &store_inner,
+                &registration_data_inner,
+                registration_type,
+            )
+            .await
             {
                 error!(%error, "failed to set account attributes, this is problematic and should never happen!");
             }
@@ -373,7 +378,13 @@ where
             ..
         }) = &content.body
         {
-            self.answer(request.r#type()).await;
+            // Only the primary answers. Signal's linked devices ignore these, and our
+            // answer reaches every device: an empty block list unblocks everyone.
+            if self.registration_type == RegistrationType::Primary {
+                self.answer(request.r#type()).await;
+            } else {
+                debug!(type = ?request.r#type(), "a linked device leaves sync requests to the primary");
+            }
         }
 
         // contacts synchronization sent from the primary device (happens after linking, or on demand)
@@ -686,11 +697,34 @@ fn decryption_error(
     })
 }
 
+/// The capabilities presage has, on any device.
+fn capabilities() -> DeviceCapabilities {
+    DeviceCapabilities {
+        storage: true,
+        transfer: false,
+        attachment_backfill: false,
+        spqr: true,
+        profiles_v2: false,
+        username_change_sync_message: true,
+    }
+}
+
 async fn set_account_attributes<S: Store>(
     account_manager: &mut AccountManager,
     store: &S,
     data: &RegistrationData,
+    registration_type: RegistrationType,
 ) -> Result<(), Error<S::Error>> {
+    // The attributes also set the account's registration lock, discoverability and access
+    // key, which are the primary's to set; Signal-Desktop, linked, sends only its capabilities.
+    if registration_type == RegistrationType::Secondary {
+        trace!("setting device capabilities");
+        account_manager
+            .set_device_capabilities(&capabilities())
+            .await?;
+        return Ok(());
+    }
+
     trace!("setting account attributes");
 
     let pni_registration_id = data.pni_registration_id.ok_or(Error::RelinkNecessary)?;
@@ -716,14 +750,7 @@ async fn set_account_attributes<S: Store>(
             registration_lock: None,
             unidentified_access_key: Some(data.profile_key.derive_access_key().to_vec()),
             unrestricted_unidentified_access: false,
-            capabilities: Some(DeviceCapabilities {
-                storage: true,
-                transfer: false,
-                attachment_backfill: false,
-                spqr: true,
-                profiles_v2: false,
-                username_change_sync_message: true,
-            }),
+            capabilities: Some(capabilities()),
             discoverable_by_phone_number: true,
             recovery_password: None,
             video: false,

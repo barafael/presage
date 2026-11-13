@@ -134,6 +134,7 @@ impl<S: Store> Manager<S, Registered> {
                 })
                 .into(),
             pending: VecDeque::new(),
+            owed: None,
             stored_packs,
             stored_packs_sender,
         };
@@ -174,6 +175,10 @@ struct Receiver<S: Store, E> {
     decrypted: VecDeque<(u64, Content)>,
     /// Told before the next envelope is read.
     pending: VecDeque<Received>,
+    /// The kept content `pending` came from: forgotten once the consumer, having taken all of
+    /// it, asks for more. A consumer that stops before (a crash, a quit while catching up) gets
+    /// it again at the next start, with whatever it hadn't done about it yet.
+    owed: Option<u64>,
     /// The ids of sticker packs installed elsewhere, once stored in the background.
     stored_packs: mpsc::UnboundedReceiver<Vec<u8>>,
     stored_packs_sender: mpsc::UnboundedSender<Vec<u8>>,
@@ -200,6 +205,9 @@ where
             if let Some(received) = self.pending.pop_front() {
                 return Some(received);
             }
+            if let Some(id) = self.owed.take() {
+                self.handled(id).await;
+            }
             if let Some((id, content)) = self.decrypted.pop_front() {
                 debug!(
                     id,
@@ -225,8 +233,8 @@ where
                     match self.open(envelope, ack).await {
                         Opened::Content { id, content } => {
                             let received = self.handle(*content).await;
-                            self.handled(id).await;
                             self.pending.extend(received);
+                            self.owed = Some(id);
                         }
                         Opened::Failed(received) => self.pending.push_back(received),
                         Opened::Nothing => {}

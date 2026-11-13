@@ -773,7 +773,6 @@ impl<S: Store> Manager<S, Registered> {
                 return None;
             }
         };
-        let story = matches!(content_body, ContentBody::StoryMessage(_));
         for _ in 0..ATTEMPTS {
             let shared = self.store.sender_key_shared(distribution_id).await.ok()?;
             for (recipient, access) in &recipients {
@@ -791,7 +790,13 @@ impl<S: Store> Manager<S, Registered> {
                     continue;
                 }
                 match sender
-                    .send_sender_key_distribution(*recipient, Some(access), &distribution, now)
+                    .send_sender_key_distribution(
+                        *recipient,
+                        Some(access),
+                        &distribution,
+                        now,
+                        content_body.urgent(),
+                    )
                     .await
                 {
                     Ok(_) => {}
@@ -826,8 +831,8 @@ impl<S: Store> Manager<S, Registered> {
                     &recipients,
                     content_body,
                     timestamp,
-                    false,
-                    !story,
+                    matches!(content_body, ContentBody::TypingMessage(_)),
+                    content_body.urgent(),
                 )
                 .await
             {

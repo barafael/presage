@@ -767,13 +767,15 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<(), Error<S::Error>> {
         let recipient = recipient.into();
 
-        let online_only = false;
         // TODO: Populate this flag based on the recipient information
         //
         // Issue <https://github.com/whisperfish/presage/issues/252>
         let include_pni_signature = false;
         let thread = Thread::Contact(recipient);
         let mut content_body: ContentBody = message.into();
+        // Only typing is for devices online now (Signal-Desktop sends nothing else so); urgency
+        // follows the content (libsignal-service `ContentBody::urgent`).
+        let online_only = matches!(content_body, ContentBody::TypingMessage(_));
 
         self.restore_thread_timer(&thread, &mut content_body).await;
         self.fetch_link_previews(&mut content_body).await;
@@ -962,7 +964,10 @@ impl<S: Store> Manager<S, Registered> {
         message: impl Into<ContentBody>,
         timestamp: u64,
     ) -> Result<(), Error<S::Error>> {
-        let mut content_body = message.into();
+        let mut content_body: ContentBody = message.into();
+        // Only typing is for devices online now (Signal-Desktop sends nothing else so); urgency
+        // follows the content (libsignal-service `ContentBody::urgent`).
+        let online_only = matches!(content_body, ContentBody::TypingMessage(_));
         let master_key_bytes = master_key_bytes
             .try_into()
             .expect("Master key bytes to be of size 32.");
@@ -1003,7 +1008,6 @@ impl<S: Store> Manager<S, Registered> {
             ));
         }
 
-        let online_only = false;
         let mut sender = self.new_message_sender().await?;
         let mut results = match self
             .send_with_sender_key(

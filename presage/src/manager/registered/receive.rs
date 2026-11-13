@@ -109,6 +109,7 @@ impl<S: Store> Manager<S, Registered> {
             envelopes: Box::pin(encrypted_messages.stream()),
             message_receiver: MessageReceiver::new(identified_push_service.clone()),
             session_lock: self.state.session_lock.clone(),
+            pni_signature_to: self.state.pni_signature_to.clone(),
             trust_roots: service_configuration.unidentified_sender_trust_roots,
             aci_address: ProtocolAddress::new(
                 self.state.data.service_ids.aci().service_id_string(),
@@ -162,6 +163,8 @@ struct Receiver<S: Store, E> {
     envelopes: E,
     message_receiver: MessageReceiver,
     session_lock: SessionLock,
+    /// Whom sends add a PNI signature for ([`super::Registered::pni_signature_to`]).
+    pni_signature_to: super::SharedServiceIds,
     trust_roots: Vec<PublicKey>,
     aci_address: ProtocolAddress,
     pni_address: ProtocolAddress,
@@ -367,8 +370,33 @@ where
         }
     }
 
+    /// Someone who wrote to our PNI gets our PNI signature with what we send, until their
+    /// delivery receipt says they took a message from our ACI, as Signal-Desktop does.
+    fn note_pni_signature(&self, content: &Content) {
+        let sender = content.metadata.sender;
+        if sender.kind() != ServiceIdKind::Aci {
+            return;
+        }
+        let to_our_pni = content.metadata.destination.kind() == ServiceIdKind::Pni;
+        let delivered = matches!(
+            &content.body,
+            ContentBody::ReceiptMessage(receipt)
+                if receipt.r#type() == libsignal_service::proto::receipt_message::Type::Delivery
+        );
+        let mut to = self
+            .pni_signature_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if to_our_pni && !delivered {
+            to.insert(sender);
+        } else if delivered {
+            to.remove(&sender);
+        }
+    }
+
     /// Handles a decrypted content: stores it, and what else it asks for.
     async fn handle(&mut self, content: Content) -> Option<Received> {
+        self.note_pni_signature(&content);
         if let ContentBody::DecryptionErrorMessage(message) = content.body {
             warn!(
                 sender = %content.metadata.sender.service_id_string(),

@@ -48,7 +48,7 @@ impl<S: Store> Manager<S, Registered> {
         let server_public_params = groups_manager.server_public_params().clone();
         let own = self.state.data.service_ids.aci();
         let own_credential = self
-            .profile_key_credential(own, self.state.data.profile_key(), &server_public_params)
+            .profile_key_credential(own, self.state.profile_key(), &server_public_params)
             .await?;
         let mut candidates = Vec::new();
         for member in members.iter().filter(|m| **m != own) {
@@ -323,7 +323,7 @@ impl<S: Store> Manager<S, Registered> {
                 // The server takes who we are and our profile key from the presentation.
                 let server_public_params = groups_manager.server_public_params().clone();
                 let credential = self
-                    .profile_key_credential(own, self.state.data.profile_key, &server_public_params)
+                    .profile_key_credential(own, self.state.profile_key(), &server_public_params)
                     .await?;
                 let presentation =
                     operations.create_member_presentation(&server_public_params, &credential);
@@ -414,7 +414,7 @@ impl<S: Store> Manager<S, Registered> {
         ));
         let own = self.state.data.service_ids.aci();
         let credential = self
-            .profile_key_credential(own, self.state.data.profile_key, &server_public_params)
+            .profile_key_credential(own, self.state.profile_key(), &server_public_params)
             .await?;
         let mut attempt = 0;
         let (info, change) = loop {
@@ -477,7 +477,7 @@ impl<S: Store> Manager<S, Registered> {
                 pending_members,
                 requesting_members: vec![crate::model::groups::RequestingMember {
                     aci: own,
-                    profile_key: self.state.data.profile_key,
+                    profile_key: self.state.profile_key(),
                     timestamp: Self::now(),
                 }],
                 invite_link_password: link.password.clone(),

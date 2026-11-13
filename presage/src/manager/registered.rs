@@ -100,7 +100,13 @@ pub struct Registered {
     /// Our profile key, which the primary may change after linking ([`Manager::set_profile_key`]);
     /// `data`'s is the one it was linked with.
     pub(crate) profile_key: Arc<std::sync::RwLock<ProfileKey>>,
+    /// Whom our messages carry a PNI signature to: those who wrote to our PNI, until their
+    /// delivery receipt shows they took a message from our ACI.
+    pub(crate) pni_signature_to: SharedServiceIds,
 }
+
+/// A set of service ids the manager, its clones and its receiver share.
+pub(crate) type SharedServiceIds = Arc<std::sync::Mutex<std::collections::HashSet<ServiceId>>>;
 
 impl fmt::Debug for Registered {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -121,6 +127,7 @@ impl Registered {
             session_lock: Default::default(),
             group_credentials: Default::default(),
             profile_key: Arc::new(std::sync::RwLock::new(data.profile_key)),
+            pni_signature_to: Default::default(),
             data: Arc::new(data),
         }
     }
@@ -817,10 +824,15 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<(), Error<S::Error>> {
         let recipient = recipient.into();
 
-        // TODO: Populate this flag based on the recipient information
-        //
-        // Issue <https://github.com/whisperfish/presage/issues/252>
-        let include_pni_signature = false;
+        // Someone who wrote to our PNI knows only our number: the signature ties our ACI to it,
+        // so that our answer joins their chat with our number (Signal-Desktop
+        // `shareMyPhoneNumber`).
+        let include_pni_signature = self
+            .state
+            .pni_signature_to
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&recipient);
         let thread = Thread::Contact(recipient);
         let mut content_body: ContentBody = message.into();
         // Only typing is for devices online now (Signal-Desktop sends nothing else so); urgency

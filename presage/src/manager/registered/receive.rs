@@ -205,8 +205,10 @@ where
                     id,
                     "handling a message decrypted before the receiver stopped"
                 );
-                let received = self.handle(content).await;
+                // Forgotten first: this is its second try, and if handling it is what
+                // stopped the receiver, a third would stop it again at every start.
                 self.handled(id).await;
+                let received = self.handle(content).await;
                 self.pending.extend(received);
                 continue;
             }

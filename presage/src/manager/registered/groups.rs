@@ -482,6 +482,9 @@ impl<S: Store> Manager<S, Registered> {
                 }],
                 invite_link_password: link.password.clone(),
                 description: info.description_text,
+                // Not in what the link shows; the group fetched once we are let in says.
+                announcements_only: false,
+                terminated: false,
             };
             let mut group = group;
             let avatar = if info.avatar.is_empty() {
@@ -1081,6 +1084,8 @@ mod invitation_tests {
             requesting_members: vec![],
             invite_link_password: vec![],
             description: None,
+            announcements_only: false,
+            terminated: false,
         };
         assert_eq!(
             told_of_changes(&group, aci, pni),
@@ -1106,6 +1111,8 @@ mod invitation_tests {
             requesting_members: vec![],
             invite_link_password: vec![],
             description: None,
+            announcements_only: false,
+            terminated: false,
         };
         assert_eq!(invited_as(&group(vec![]), aci, pni), None);
         let by_aci = group(vec![pending(

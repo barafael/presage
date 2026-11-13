@@ -97,6 +97,9 @@ pub struct Registered {
     pub(crate) group_credentials: SharedGroupCredentials,
 
     pub(crate) data: Arc<RegistrationData>,
+    /// Our profile key, which the primary may change after linking ([`Manager::set_profile_key`]);
+    /// `data`'s is the one it was linked with.
+    pub(crate) profile_key: Arc<std::sync::RwLock<ProfileKey>>,
 }
 
 impl fmt::Debug for Registered {
@@ -117,8 +120,17 @@ impl Registered {
             settings: Default::default(),
             session_lock: Default::default(),
             group_credentials: Default::default(),
+            profile_key: Arc::new(std::sync::RwLock::new(data.profile_key)),
             data: Arc::new(data),
         }
+    }
+
+    /// Our profile key, as it is now.
+    pub(crate) fn profile_key(&self) -> ProfileKey {
+        *self
+            .profile_key
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn servers(&self) -> SignalServers {
@@ -235,9 +247,34 @@ impl<S: Store> Manager<S, Registered> {
         &self.store
     }
 
-    /// Returns a handle on the [RegistrationData].
+    /// Returns a handle on the [RegistrationData]. Its profile key is the one this device was
+    /// registered or linked with; [`Self::profile_key`] is ours as it is now.
     pub fn registration_data(&self) -> &RegistrationData {
         &self.state.data
+    }
+
+    /// Our profile key, as it is now.
+    pub fn profile_key(&self) -> ProfileKey {
+        self.state.profile_key()
+    }
+
+    /// Takes a new profile key of ours, as the primary device makes one (on blocking someone
+    /// it shared its profile with, say) and tells its other devices: it goes into what is sent
+    /// from now on, and is saved. A linked device learns it from the storage service's account
+    /// record and our own sent messages, as Signal-Desktop does. Whether it was new.
+    pub async fn set_profile_key(&mut self, key: ProfileKey) -> Result<bool, Error<S::Error>> {
+        if self.state.profile_key().get_bytes() == key.get_bytes() {
+            return Ok(false);
+        }
+        let mut data = (*self.state.data).clone();
+        data.profile_key = key;
+        self.store.save_registration_data(&data).await?;
+        *self
+            .state
+            .profile_key
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = key;
+        Ok(true)
     }
 
     /// The lock this manager and its clones take each session step under: a client that
@@ -465,7 +502,7 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Fetches the profile (name, about, status emoji) of the registered user.
     pub async fn retrieve_profile(&mut self) -> Result<Profile, Error<S::Error>> {
-        self.retrieve_profile_by_uuid(self.state.data.service_ids.aci, self.state.data.profile_key)
+        self.retrieve_profile_by_uuid(self.state.data.service_ids.aci, self.state.profile_key())
             .await
     }
 
@@ -555,7 +592,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
 
         account_manager
@@ -573,7 +610,7 @@ impl<S: Store> Manager<S, Registered> {
         let profile = account_manager.retrieve_profile(aci).await?;
         let _ = self
             .store
-            .save_profile(aci.into(), self.state.data.profile_key, profile)
+            .save_profile(aci.into(), self.state.profile_key(), profile)
             .await;
 
         Ok(())
@@ -795,7 +832,7 @@ impl<S: Store> Manager<S, Registered> {
         if let ContentBody::DataMessage(message) = &mut content_body {
             message
                 .profile_key
-                .get_or_insert(self.state.data.profile_key().get_bytes().to_vec());
+                .get_or_insert(self.state.profile_key().get_bytes().to_vec());
             message.required_protocol_version = Some(0);
         }
 
@@ -1454,7 +1491,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
 
         account_manager
@@ -1501,7 +1538,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
@@ -1526,7 +1563,7 @@ impl<S: Store> Manager<S, Registered> {
         let mut account_manager = AccountManager::new(
             self.identified_push_service(),
             self.identified_websocket(false).await?,
-            Some(self.state.data.profile_key),
+            Some(self.state.profile_key()),
         );
         account_manager
             .update_device_name(

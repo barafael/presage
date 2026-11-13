@@ -655,7 +655,7 @@ impl ContentsStore for SqliteStore {
             .await?;
         }
         query!(
-            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             master_key,
             g.title,
             g.revision,
@@ -667,6 +667,8 @@ impl ContentsStore for SqliteStore {
             g.pending_members,
             g.requesting_members,
             g.disappearing_messages_timer,
+            g.announcements_only,
+            g.terminated,
         )
         .execute(&mut *transaction)
         .await?;
@@ -719,7 +721,9 @@ impl ContentsStore for SqliteStore {
                 members AS "members: _",
                 pending_members AS "pending_members: _",
                 requesting_members AS "requesting_members: _",
-                disappearing_messages_timer
+                disappearing_messages_timer,
+                announcements_only AS "announcements_only: bool",
+                terminated AS "terminated: bool"
             FROM groups"#,
         )
         .fetch_all(&self.db)
@@ -745,7 +749,9 @@ impl ContentsStore for SqliteStore {
                 members AS "members: _",
                 pending_members AS "pending_members: _",
                 requesting_members AS "requesting_members: _",
-                disappearing_messages_timer
+                disappearing_messages_timer,
+                announcements_only AS "announcements_only: bool",
+                terminated AS "terminated: bool"
             FROM groups
             WHERE master_key = ?
             LIMIT 1"#,
@@ -1164,6 +1170,8 @@ mod test {
             requesting_members: vec![],
             invite_link_password: vec![],
             description: None,
+            announcements_only: false,
+            terminated: false,
         };
         store.save_group(master_key, group).await?;
         assert!(!store.is_group_left(master_key).await?);
@@ -1221,9 +1229,18 @@ mod test {
             requesting_members: vec![],
             invite_link_password: vec![],
             description: None,
+            announcements_only: false,
+            terminated: false,
         };
         assert!(store.profile_key(&aci.into()).await?.is_none());
+        let group = Group {
+            announcements_only: true,
+            terminated: true,
+            ..group
+        };
         store.save_group([2u8; 32], group).await?;
+        let saved = store.group([2u8; 32]).await?.expect("the group");
+        assert!(saved.announcements_only && saved.terminated);
         let kept = store
             .profile_key(&aci.into())
             .await?

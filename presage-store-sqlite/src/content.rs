@@ -293,17 +293,20 @@ impl ContentsStore for SqliteStore {
     async fn delete_message(
         &mut self,
         thread: &Thread,
+        sender: &ServiceId,
         timestamp: u64,
     ) -> Result<bool, Self::ContentsStoreError> {
         let timestamp: i64 = timestamp
             .try_into()
             .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let sender_service_id = sender.service_id_string();
         let (group_master_key, recipient_id) = thread.unzip();
         let res = query!(
             "DELETE FROM thread_messages
-            WHERE ts = ? AND thread_id = (
+            WHERE ts = ? AND sender_service_id = ? AND thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)",
             timestamp,
+            sender_service_id,
             group_master_key,
             recipient_id,
         )
@@ -315,11 +318,13 @@ impl ContentsStore for SqliteStore {
     async fn message(
         &self,
         thread: &Thread,
+        sender: &ServiceId,
         timestamp: u64,
     ) -> Result<Option<Content>, Self::ContentsStoreError> {
         let timestamp: i64 = timestamp
             .try_into()
             .map_err(|_| SqliteStoreError::InvalidFormat)?;
+        let sender_service_id = sender.service_id_string();
         let (group_master_key, recipient_id) = thread.unzip();
         let message = query_as!(
             SqlMessage,
@@ -335,9 +340,10 @@ impl ContentsStore for SqliteStore {
                 was_plaintext,
                 pni_verified
             FROM thread_messages
-            WHERE ts = ? AND thread_id = (
+            WHERE ts = ? AND sender_service_id = ? AND thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)"#,
             timestamp,
+            sender_service_id,
             group_master_key,
             recipient_id,
         )
@@ -357,7 +363,11 @@ impl ContentsStore for SqliteStore {
         let (start_incl, start_excl) = params.range.start_bound().into_sql_bound();
         let (end_incl, end_excl) = params.range.end_bound().into_sql_bound();
 
+        // A limited page holds all the messages at its last timestamp, more than `limit` if
+        // several share it: a following page starts past that timestamp, and two senders'
+        // messages at one millisecond are both kept.
         let rows = match (params.limit, params.order) {
+            (Some(0), _) => Vec::new(),
             (None, MessageIterationOrder::TimestampDescending) => {
                 query_as!(
                     SqlMessage,
@@ -374,10 +384,10 @@ impl ContentsStore for SqliteStore {
                 pni_verified
             FROM thread_messages
             WHERE thread_id = (
-                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
-                AND coalesce(ts > ?, ts >= ?, true)
-                AND coalesce(ts < ?, ts <= ?, true)
-            ORDER BY ts DESC"#,
+                SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
+                AND coalesce(ts > ?3, ts >= ?4, true)
+                AND coalesce(ts < ?5, ts <= ?6, true)
+            ORDER BY ts DESC, sender_service_id"#,
                     group_master_key,
                     recipient_id,
                     start_incl,
@@ -404,10 +414,10 @@ impl ContentsStore for SqliteStore {
                 pni_verified
             FROM thread_messages
             WHERE thread_id = (
-                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
-                AND coalesce(ts > ?, ts >= ?, true)
-                AND coalesce(ts < ?, ts <= ?, true)
-            ORDER BY ts DESC"#,
+                SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
+                AND coalesce(ts > ?3, ts >= ?4, true)
+                AND coalesce(ts < ?5, ts <= ?6, true)
+            ORDER BY ts ASC, sender_service_id"#,
                     group_master_key,
                     recipient_id,
                     start_incl,
@@ -419,6 +429,7 @@ impl ContentsStore for SqliteStore {
                 .await?
             }
             (Some(limit), MessageIterationOrder::TimestampDescending) => {
+                let last = i64::try_from(limit - 1).unwrap_or(i64::MAX);
                 query_as!(
                     SqlMessage,
                     r#"SELECT
@@ -434,23 +445,32 @@ impl ContentsStore for SqliteStore {
                 pni_verified
             FROM thread_messages
             WHERE thread_id = (
-                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
-                AND coalesce(ts > ?, ts >= ?, true)
-                AND coalesce(ts < ?, ts <= ?, true)
-            ORDER BY ts DESC
-            LIMIT ?"#,
+                SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
+                AND coalesce(ts > ?3, ts >= ?4, true)
+                AND coalesce(ts < ?5, ts <= ?6, true)
+                AND ts >= coalesce((
+                    SELECT ts FROM thread_messages
+                    WHERE thread_id = (
+                        SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
+                        AND coalesce(ts > ?3, ts >= ?4, true)
+                        AND coalesce(ts < ?5, ts <= ?6, true)
+                    ORDER BY ts DESC
+                    LIMIT 1 OFFSET ?7
+                ), ts)
+            ORDER BY ts DESC, sender_service_id"#,
                     group_master_key,
                     recipient_id,
                     start_incl,
                     start_excl,
                     end_incl,
                     end_excl,
-                    limit as i64
+                    last
                 )
                 .fetch_all(&self.db)
                 .await?
             }
             (Some(limit), MessageIterationOrder::TimestampAscending) => {
+                let last = i64::try_from(limit - 1).unwrap_or(i64::MAX);
                 query_as!(
                     SqlMessage,
                     r#"SELECT
@@ -466,18 +486,26 @@ impl ContentsStore for SqliteStore {
                 pni_verified
             FROM thread_messages
             WHERE thread_id = (
-                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)
-                AND coalesce(ts > ?, ts >= ?, true)
-                AND coalesce(ts < ?, ts <= ?, true)
-            ORDER BY ts ASC
-            LIMIT ?"#,
+                SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
+                AND coalesce(ts > ?3, ts >= ?4, true)
+                AND coalesce(ts < ?5, ts <= ?6, true)
+                AND ts <= coalesce((
+                    SELECT ts FROM thread_messages
+                    WHERE thread_id = (
+                        SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
+                        AND coalesce(ts > ?3, ts >= ?4, true)
+                        AND coalesce(ts < ?5, ts <= ?6, true)
+                    ORDER BY ts ASC
+                    LIMIT 1 OFFSET ?7
+                ), ts)
+            ORDER BY ts ASC, sender_service_id"#,
                     group_master_key,
                     recipient_id,
                     start_incl,
                     start_excl,
                     end_incl,
                     end_excl,
-                    limit as i64
+                    last
                 )
                 .fetch_all(&self.db)
                 .await?
@@ -1296,7 +1324,7 @@ mod test {
                 })),
             )
             .await?;
-        let found = |timestamp| store.message_sent_or_edited_at(&thread, timestamp);
+        let found = |timestamp| store.message_sent_or_edited_at(&thread, &sender, timestamp);
         assert_eq!(
             found(1_000).await?.map(|c| c.edited_at()),
             Some(Some(2_000))
@@ -1306,6 +1334,79 @@ mod test {
             Some(Some(2_000))
         );
         assert!(found(3_000).await?.is_none());
+        let someone_else = ServiceId::Aci(Uuid::from_u128(8).into());
+        assert!(
+            store
+                .message_sent_or_edited_at(&thread, &someone_else, 2_000)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keeps_two_senders_at_one_millisecond() -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::TimeZone;
+        use presage::libsignal_service::content::ContentBody;
+        use presage::proto::DataMessage;
+
+        let mut store = SqliteStore::open(":memory:", OnNewIdentity::Trust).await?;
+        let (ann, bob) = (
+            ServiceId::Aci(Uuid::from_u128(7).into()),
+            ServiceId::Aci(Uuid::from_u128(8).into()),
+        );
+        let thread = Thread::Group([1; 32]);
+        let message = |sender, ts: u64| {
+            let at = chrono::Utc.timestamp_millis_opt(ts as i64).unwrap();
+            Content {
+                metadata: Metadata {
+                    sender,
+                    destination: sender,
+                    sender_device: 1.try_into().unwrap(),
+                    client_timestamp: at,
+                    server_timestamp: at,
+                    needs_receipt: false,
+                    unidentified_sender: false,
+                    server_guid: None,
+                    was_plaintext: false,
+                    pni_verified: None,
+                },
+                body: ContentBody::DataMessage(DataMessage {
+                    timestamp: Some(ts),
+                    ..Default::default()
+                }),
+            }
+        };
+        for (sender, ts) in [(ann, 1), (ann, 2), (bob, 2), (ann, 3)] {
+            store.save_message(&thread, message(sender, ts)).await?;
+        }
+        let sender_at = |content: Option<Content>| content.map(|c| c.metadata.sender);
+        assert_eq!(sender_at(store.message(&thread, &ann, 2).await?), Some(ann));
+        assert_eq!(sender_at(store.message(&thread, &bob, 2).await?), Some(bob));
+
+        // A page doesn't part messages at one time: the next one starts before it.
+        let times = |page: <SqliteStore as ContentsStore>::MessagesIter| {
+            page.map(|c| c.map(|c| c.metadata.client_timestamp.timestamp_millis() as u64))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let newest = |before, limit| {
+            store.messages(&thread, MessagesQueryParams::from(..before).limit(limit))
+        };
+        let oldest = |from, limit| {
+            store.messages(
+                &thread,
+                MessagesQueryParams::from(from..).limit(limit).ascending(),
+            )
+        };
+        assert_eq!(times(newest(4, 2).await?)?, [3, 2, 2]);
+        assert_eq!(times(newest(2, 2).await?)?, [1]);
+        assert_eq!(times(oldest(1, 1).await?)?, [1]);
+        assert_eq!(times(oldest(2, 1).await?)?, [2, 2]);
+        assert!(times(newest(4, 0).await?)?.is_empty());
+
+        assert!(store.delete_message(&thread, &bob, 2).await?);
+        assert!(store.message(&thread, &bob, 2).await?.is_none());
+        assert_eq!(sender_at(store.message(&thread, &ann, 2).await?), Some(ann));
         Ok(())
     }
 }

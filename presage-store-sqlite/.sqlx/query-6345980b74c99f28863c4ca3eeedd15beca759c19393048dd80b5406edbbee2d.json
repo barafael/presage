@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                ts AS \"ts: _\",\n                server_ts AS \"server_ts: _\",\n                sender_service_id,\n                sender_device_id AS \"sender_device_id: _\",\n                destination_service_id,\n                needs_receipt,\n                unidentified_sender,\n                content_body,\n                was_plaintext,\n                pni_verified\n            FROM thread_messages\n            WHERE thread_id = (\n                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)\n                AND coalesce(ts > ?, ts >= ?, true)\n                AND coalesce(ts < ?, ts <= ?, true)\n            ORDER BY ts ASC\n            LIMIT ?",
+  "query": "SELECT\n                ts AS \"ts: _\",\n                server_ts AS \"server_ts: _\",\n                sender_service_id,\n                sender_device_id AS \"sender_device_id: _\",\n                destination_service_id,\n                needs_receipt,\n                unidentified_sender,\n                content_body,\n                was_plaintext,\n                pni_verified\n            FROM thread_messages\n            WHERE thread_id = (\n                SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)\n                AND coalesce(ts > ?3, ts >= ?4, true)\n                AND coalesce(ts < ?5, ts <= ?6, true)\n                AND ts <= coalesce((\n                    SELECT ts FROM thread_messages\n                    WHERE thread_id = (\n                        SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)\n                        AND coalesce(ts > ?3, ts >= ?4, true)\n                        AND coalesce(ts < ?5, ts <= ?6, true)\n                    ORDER BY ts ASC\n                    LIMIT 1 OFFSET ?7\n                ), ts)\n            ORDER BY ts ASC, sender_service_id",
   "describe": {
     "columns": [
       {
@@ -130,5 +130,5 @@
       true
     ]
   },
-  "hash": "86cf758c36c60eacb1416639433fe29e921caa2773902223d0b31cd93bdf9419"
+  "hash": "6345980b74c99f28863c4ca3eeedd15beca759c19393048dd80b5406edbbee2d"
 }

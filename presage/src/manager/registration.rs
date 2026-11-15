@@ -37,8 +37,8 @@ impl<S: Store> Manager<S, Registration> {
     ///     configuration::SignalServers, prelude::phonenumber::PhoneNumber,
     /// };
     /// use presage::manager::RegistrationOptions;
-    /// use presage::Manager;
     /// use presage::model::identity::OnNewIdentity;
+    /// use presage::Manager;
     ///
     /// use presage_store_sqlite::SqliteStore;
     ///

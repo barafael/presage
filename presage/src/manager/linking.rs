@@ -31,8 +31,8 @@ impl<S: Store> Manager<S, Linking> {
     /// ```no_run
     /// use futures::{channel::oneshot, future, StreamExt};
     /// use presage::libsignal_service::configuration::SignalServers;
-    /// use presage::Manager;
     /// use presage::model::identity::OnNewIdentity;
+    /// use presage::Manager;
     /// use presage_store_sqlite::SqliteStore;
     ///
     /// #[tokio::main]

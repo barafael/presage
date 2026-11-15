@@ -130,44 +130,48 @@ pub trait ContentsStore: Send + Sync {
         thread: &Thread,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
-    /// Save a message in a [Thread] identified by a timestamp.
+    /// Save a message in a [Thread], in the place of its sender's message at its timestamp.
     fn save_message(
         &self,
         thread: &Thread,
         message: Content,
     ) -> impl Future<Output = Result<(), Self::ContentsStoreError>>;
 
-    /// Delete a single message, identified by its received timestamp from a thread.
+    /// Delete a single message from a thread, identified by its sender and timestamp.
     /// Useful when you want to delete a message locally only.
     fn delete_message(
         &mut self,
         thread: &Thread,
+        sender: &ServiceId,
         timestamp: u64,
     ) -> impl Future<Output = Result<bool, Self::ContentsStoreError>>;
 
-    /// Retrieve a message from a [Thread] by its timestamp.
+    /// Retrieve a message from a [Thread] by its sender and timestamp. A message is known by
+    /// both, as Signal's apps know it: two senders' messages can have the same timestamp.
     fn message(
         &self,
         thread: &Thread,
+        sender: &ServiceId,
         timestamp: u64,
     ) -> impl Future<Output = Result<Option<Content>, Self::ContentsStoreError>>;
 
-    /// Retrieve the message `timestamp` names in a [Thread]: the one sent then, or else the one
-    /// whose latest edit was. Signal's apps name an edited message by its latest edit's time,
-    /// and an edit comes within [EDIT_WINDOW_MS] of the message.
+    /// Retrieve the message of `sender`'s that `timestamp` names in a [Thread]: the one sent
+    /// then, or else the one whose latest edit was. Signal's apps name an edited message by its
+    /// latest edit's time, and an edit comes within [EDIT_WINDOW_MS] of the message.
     fn message_sent_or_edited_at(
         &self,
         thread: &Thread,
+        sender: &ServiceId,
         timestamp: u64,
     ) -> impl Future<Output = Result<Option<Content>, Self::ContentsStoreError>> {
         async move {
-            if let Some(message) = self.message(thread, timestamp).await? {
+            if let Some(message) = self.message(thread, sender, timestamp).await? {
                 return Ok(Some(message));
             }
             let since = timestamp.saturating_sub(EDIT_WINDOW_MS);
             for message in self.messages(thread, since..timestamp).await? {
                 let message = message?;
-                if message.edited_at() == Some(timestamp) {
+                if message.metadata.sender == *sender && message.edited_at() == Some(timestamp) {
                     return Ok(Some(message));
                 }
             }
@@ -207,7 +211,8 @@ pub trait ContentsStore: Send + Sync {
     ) -> impl Future<Output = Result<Self::MessagesIter, Self::ContentsStoreError>>;
 
     /// Retrieve up to `limit` messages from a [Thread] sent before `before` (or the
-    /// newest), newest first.
+    /// newest), newest first. More when others share the oldest one's timestamp: a page
+    /// holds all of a timestamp's messages, as the next page starts before it.
     fn messages_before(
         &self,
         thread: &Thread,

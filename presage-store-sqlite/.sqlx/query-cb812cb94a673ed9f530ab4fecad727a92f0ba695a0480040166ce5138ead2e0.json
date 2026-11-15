@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT\n                ts AS \"ts: _\",\n                server_ts AS \"server_ts: _\",\n                sender_service_id,\n                sender_device_id AS \"sender_device_id: _\",\n                destination_service_id,\n                needs_receipt,\n                unidentified_sender,\n                content_body,\n                was_plaintext,\n                pni_verified\n            FROM thread_messages\n            WHERE ts = ? AND thread_id = (\n                SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?)",
+  "query": "SELECT\n                ts AS \"ts: _\",\n                server_ts AS \"server_ts: _\",\n                sender_service_id,\n                sender_device_id AS \"sender_device_id: _\",\n                destination_service_id,\n                needs_receipt,\n                unidentified_sender,\n                content_body,\n                was_plaintext,\n                pni_verified\n            FROM thread_messages\n            WHERE thread_id = (\n                SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)\n                AND coalesce(ts > ?3, ts >= ?4, true)\n                AND coalesce(ts < ?5, ts <= ?6, true)\n                AND ts >= coalesce((\n                    SELECT ts FROM thread_messages\n                    WHERE thread_id = (\n                        SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)\n                        AND coalesce(ts > ?3, ts >= ?4, true)\n                        AND coalesce(ts < ?5, ts <= ?6, true)\n                    ORDER BY ts DESC\n                    LIMIT 1 OFFSET ?7\n                ), ts)\n            ORDER BY ts DESC, sender_service_id",
   "describe": {
     "columns": [
       {
@@ -115,7 +115,7 @@
       }
     ],
     "parameters": {
-      "Right": 3
+      "Right": 7
     },
     "nullable": [
       false,
@@ -130,5 +130,5 @@
       true
     ]
   },
-  "hash": "3fb52795bcd799f3075078a8dc202fa6d412a92bbcf41b4f3c6e6ae4b625c25b"
+  "hash": "cb812cb94a673ed9f530ab4fecad727a92f0ba695a0480040166ce5138ead2e0"
 }

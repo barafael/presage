@@ -198,6 +198,10 @@ enum Opened {
     Nothing,
 }
 
+/// How often a message decrypted before the receiver stopped is tried again, at a start each,
+/// before it is given up: its handling may be what stopped the receiver.
+const KEPT_TRIES: u32 = 5;
+
 impl<S, E> Receiver<S, E>
 where
     S: Store,
@@ -212,15 +216,31 @@ where
                 self.handled(id).await;
             }
             if let Some((id, content)) = self.decrypted.pop_front() {
-                debug!(
-                    id,
-                    "handling a message decrypted before the receiver stopped"
-                );
-                // Forgotten first: this is its second try, and if handling it is what
-                // stopped the receiver, a third would stop it again at every start.
-                self.handled(id).await;
+                // Tried again at each start until it is handled: a receiver may stop again
+                // before it is done, as presage-cli does after each command, and a message
+                // forgotten before then is lost. One whose handling stops the receiver itself
+                // is given up after a few tries, or it would stop it at every start.
+                match self.store.tried(id).await {
+                    Ok(tries) if tries > KEPT_TRIES => {
+                        warn!(
+                            id,
+                            tries, "giving up on a message decrypted before the receiver stopped"
+                        );
+                        self.handled(id).await;
+                        continue;
+                    }
+                    Ok(tries) => debug!(
+                        id,
+                        tries, "handling a message decrypted before the receiver stopped"
+                    ),
+                    Err(error) => {
+                        error!(%error, "failed to count a try at a kept message; handling it")
+                    }
+                }
                 let received = self.handle(content).await;
                 self.pending.extend(received);
+                // Forgotten once the consumer asks for the next, as one just decrypted.
+                self.owed = Some(id);
                 continue;
             }
             let incoming =

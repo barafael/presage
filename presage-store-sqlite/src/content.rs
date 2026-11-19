@@ -360,14 +360,25 @@ impl ContentsStore for SqliteStore {
         let params = params.into();
         let (group_master_key, recipient_id) = thread.unzip();
 
-        let (start_incl, start_excl) = params.range.start_bound().into_sql_bound();
-        let (end_incl, end_excl) = params.range.end_bound().into_sql_bound();
+        // The range as the first and last time in it, so that the thread's messages are found
+        // by their time rather than all tested.
+        let first = match params.range.start_bound() {
+            Bound::Included(&ts) => to_sql_ts(ts),
+            Bound::Excluded(&ts) => to_sql_ts(ts).saturating_add(1),
+            Bound::Unbounded => i64::MIN,
+        };
+        let last = match params.range.end_bound() {
+            Bound::Included(&ts) => to_sql_ts(ts),
+            Bound::Excluded(&ts) => to_sql_ts(ts).saturating_sub(1),
+            Bound::Unbounded => i64::MAX,
+        };
 
         // A limited page holds all the messages at its last timestamp, more than `limit` if
         // several share it: a following page starts past that timestamp, and two senders'
         // messages at one millisecond are both kept.
         let rows = match (params.limit, params.order) {
             (Some(0), _) => Vec::new(),
+            _ if first > last => Vec::new(),
             (None, MessageIterationOrder::TimestampDescending) => {
                 query_as!(
                     SqlMessage,
@@ -385,15 +396,12 @@ impl ContentsStore for SqliteStore {
             FROM thread_messages
             WHERE thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
-                AND coalesce(ts > ?3, ts >= ?4, true)
-                AND coalesce(ts < ?5, ts <= ?6, true)
-            ORDER BY ts DESC, sender_service_id"#,
+                AND ts BETWEEN ?3 AND ?4
+            ORDER BY ts DESC, sender_service_id DESC"#,
                     group_master_key,
                     recipient_id,
-                    start_incl,
-                    start_excl,
-                    end_incl,
-                    end_excl
+                    first,
+                    last
                 )
                 .fetch_all(&self.db)
                 .await?
@@ -415,21 +423,18 @@ impl ContentsStore for SqliteStore {
             FROM thread_messages
             WHERE thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
-                AND coalesce(ts > ?3, ts >= ?4, true)
-                AND coalesce(ts < ?5, ts <= ?6, true)
+                AND ts BETWEEN ?3 AND ?4
             ORDER BY ts ASC, sender_service_id"#,
                     group_master_key,
                     recipient_id,
-                    start_incl,
-                    start_excl,
-                    end_incl,
-                    end_excl
+                    first,
+                    last
                 )
                 .fetch_all(&self.db)
                 .await?
             }
             (Some(limit), MessageIterationOrder::TimestampDescending) => {
-                let last = i64::try_from(limit - 1).unwrap_or(i64::MAX);
+                let offset = i64::try_from(limit - 1).unwrap_or(i64::MAX);
                 query_as!(
                     SqlMessage,
                     r#"SELECT
@@ -446,31 +451,27 @@ impl ContentsStore for SqliteStore {
             FROM thread_messages
             WHERE thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
-                AND coalesce(ts > ?3, ts >= ?4, true)
-                AND coalesce(ts < ?5, ts <= ?6, true)
+                AND ts BETWEEN ?3 AND ?4
                 AND ts >= coalesce((
                     SELECT ts FROM thread_messages
                     WHERE thread_id = (
                         SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
-                        AND coalesce(ts > ?3, ts >= ?4, true)
-                        AND coalesce(ts < ?5, ts <= ?6, true)
+                        AND ts BETWEEN ?3 AND ?4
                     ORDER BY ts DESC
-                    LIMIT 1 OFFSET ?7
-                ), ts)
-            ORDER BY ts DESC, sender_service_id"#,
+                    LIMIT 1 OFFSET ?5
+                ), ?3)
+            ORDER BY ts DESC, sender_service_id DESC"#,
                     group_master_key,
                     recipient_id,
-                    start_incl,
-                    start_excl,
-                    end_incl,
-                    end_excl,
-                    last
+                    first,
+                    last,
+                    offset
                 )
                 .fetch_all(&self.db)
                 .await?
             }
             (Some(limit), MessageIterationOrder::TimestampAscending) => {
-                let last = i64::try_from(limit - 1).unwrap_or(i64::MAX);
+                let offset = i64::try_from(limit - 1).unwrap_or(i64::MAX);
                 query_as!(
                     SqlMessage,
                     r#"SELECT
@@ -487,25 +488,21 @@ impl ContentsStore for SqliteStore {
             FROM thread_messages
             WHERE thread_id = (
                 SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
-                AND coalesce(ts > ?3, ts >= ?4, true)
-                AND coalesce(ts < ?5, ts <= ?6, true)
+                AND ts BETWEEN ?3 AND ?4
                 AND ts <= coalesce((
                     SELECT ts FROM thread_messages
                     WHERE thread_id = (
                         SELECT id FROM threads WHERE group_master_key = ?1 OR recipient_id = ?2)
-                        AND coalesce(ts > ?3, ts >= ?4, true)
-                        AND coalesce(ts < ?5, ts <= ?6, true)
+                        AND ts BETWEEN ?3 AND ?4
                     ORDER BY ts ASC
-                    LIMIT 1 OFFSET ?7
-                ), ts)
+                    LIMIT 1 OFFSET ?5
+                ), ?4)
             ORDER BY ts ASC, sender_service_id"#,
                     group_master_key,
                     recipient_id,
-                    start_incl,
-                    start_excl,
-                    end_incl,
-                    end_excl,
-                    last
+                    first,
+                    last,
+                    offset
                 )
                 .fetch_all(&self.db)
                 .await?
@@ -1146,18 +1143,9 @@ impl ThreadExt for Thread {
     }
 }
 
-trait BoundExt {
-    fn into_sql_bound(self) -> (Option<i64>, Option<i64>);
-}
-
-impl BoundExt for Bound<&u64> {
-    fn into_sql_bound(self) -> (Option<i64>, Option<i64>) {
-        match self {
-            Bound::Excluded(x) => (Some(*x as i64), None),
-            Bound::Included(x) => (None, Some(*x as i64)),
-            Bound::Unbounded => (None, None),
-        }
-    }
+/// A time as SQLite keeps it; one past what it can hold is the last it can.
+fn to_sql_ts(ts: u64) -> i64 {
+    i64::try_from(ts).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -1399,6 +1387,8 @@ mod test {
             )
         };
         assert_eq!(times(newest(4, 2).await?)?, [3, 2, 2]);
+        // Past what SQLite holds is still past every message.
+        assert_eq!(times(newest(u64::MAX, 2).await?)?, [3, 2, 2]);
         assert_eq!(times(newest(2, 2).await?)?, [1]);
         assert_eq!(times(oldest(1, 1).await?)?, [1]);
         assert_eq!(times(oldest(2, 1).await?)?, [2, 2]);

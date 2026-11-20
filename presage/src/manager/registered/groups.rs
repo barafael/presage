@@ -17,7 +17,7 @@ use libsignal_service::{
     },
 };
 use rand::rng;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{ensure_data_message_timestamp, upsert_group, MessageSender, Registered};
 
@@ -899,8 +899,16 @@ impl<S: Store> Manager<S, Registered> {
             .send_with_sender_key(&mut sender, key, None, &sealed, &content_body, timestamp)
             .await
         {
+            info!(
+                recipients = sealed.len(),
+                "sent a story to a story list in one request, with its sender key"
+            );
             return Ok(results);
         }
+        info!(
+            recipients = sealed.len(),
+            "sending a story to a story list to each recipient"
+        );
         Ok(sender
             .send_message_to_group(&sealed, content_body, timestamp, false)
             .await)

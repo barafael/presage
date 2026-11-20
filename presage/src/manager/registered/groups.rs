@@ -27,6 +27,10 @@ use crate::model::messages::MissedGroupChange;
 use crate::store::{Store, Thread};
 use crate::{model::groups::Group, Error, Manager};
 
+/// The second half of a story list's key for its sender key in the store
+/// ([`Manager::send_story_to_list`]): a group's is its 32-byte master key.
+const STORY_LIST_KEY: &[u8; 16] = b"story list key\0\0";
+
 impl<S: Store> Manager<S, Registered> {
     /// Members without a known profile key are invited. Returns the master key and the
     /// timestamp of the message telling the members.
@@ -739,11 +743,11 @@ impl<S: Store> Manager<S, Registered> {
         &mut self,
         sender: &mut MessageSender<S::AciStore>,
         master_key: [u8; 32],
+        group_id: Option<&[u8]>,
         recipients: &[(ServiceId, Option<UnidentifiedAccess>, bool)],
         content_body: &ContentBody,
         timestamp: u64,
     ) -> Option<Vec<libsignal_service::sender::SendMessageResult>> {
-        use libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
         const ATTEMPTS: usize = 3;
 
         let recipients: Vec<(ServiceId, UnidentifiedAccess)> = recipients
@@ -764,8 +768,6 @@ impl<S: Store> Manager<S, Registered> {
             }
         };
         let distribution_id = key.distribution_id;
-        let group_id = GroupSecretParams::derive_from_master_key(GroupMasterKey::new(master_key))
-            .get_group_identifier();
         let distribution = match sender
             .sender_key_distribution_message(distribution_id)
             .await
@@ -830,7 +832,7 @@ impl<S: Store> Manager<S, Registered> {
             match sender
                 .send_with_sender_key(
                     distribution_id,
-                    &group_id,
+                    group_id,
                     &recipients,
                     content_body,
                     timestamp,
@@ -850,6 +852,58 @@ impl<S: Store> Manager<S, Registered> {
             }
         }
         None
+    }
+
+    /// Sends `story` to `recipients` as a story to the story list `list` (My Story, all zeros,
+    /// or one of the account's own; its 16-byte id), as Signal's apps do: encrypted once with
+    /// our sender key for the list and sealed for every device in one request
+    /// (`PUT /v1/messages/multi_recipient?story=true`), without a group id; to each recipient
+    /// on their own where that can't be done (fewer than two, or the sender key fails).
+    ///
+    /// The list's sender key is kept and renewed as a group's is: anew once someone it was
+    /// shared with is no longer among `recipients`, so they can't read what follows. It is
+    /// stored under the list's id padded to a group key's length with `STORY_LIST_KEY`, which
+    /// no group's master key is.
+    ///
+    /// Our other devices aren't told: the caller sends them a sync naming the list. Returns a
+    /// result per recipient, in their order.
+    pub async fn send_story_to_list(
+        &mut self,
+        list: [u8; 16],
+        recipients: &[ServiceId],
+        story: libsignal_service::proto::StoryMessage,
+        timestamp: u64,
+    ) -> Result<Vec<libsignal_service::sender::SendMessageResult>, Error<S::Error>> {
+        let content_body = ContentBody::StoryMessage(story);
+        let sender_certificate = self.sender_certificate().await?;
+        let mut sealed = Vec::new();
+        for recipient in recipients {
+            // A story needs no access key (the server checks none), but one of theirs does no
+            // harm where it is known.
+            let access = self
+                .store
+                .profile_key(recipient)
+                .await?
+                .map(|profile_key| UnidentifiedAccess {
+                    key: profile_key.derive_access_key().to_vec(),
+                    certificate: sender_certificate.clone(),
+                })
+                .or_else(|| super::story_access(&content_body, &sender_certificate));
+            sealed.push((*recipient, access, false));
+        }
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(&list);
+        key[16..].copy_from_slice(STORY_LIST_KEY);
+        let mut sender = self.new_message_sender().await?;
+        if let Some(results) = self
+            .send_with_sender_key(&mut sender, key, None, &sealed, &content_body, timestamp)
+            .await
+        {
+            return Ok(results);
+        }
+        Ok(sender
+            .send_message_to_group(&sealed, content_body, timestamp, false)
+            .await)
     }
 
     /// Makes the group's sender key anew: the next message to the group hands it to every

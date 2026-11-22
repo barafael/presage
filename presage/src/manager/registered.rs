@@ -1075,10 +1075,11 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         let mut sender = self.new_message_sender().await?;
-        let group_id = libsignal_service::zkgroup::groups::GroupSecretParams::derive_from_master_key(
-            libsignal_service::zkgroup::groups::GroupMasterKey::new(master_key_bytes),
-        )
-        .get_group_identifier();
+        let group_id =
+            libsignal_service::zkgroup::groups::GroupSecretParams::derive_from_master_key(
+                libsignal_service::zkgroup::groups::GroupMasterKey::new(master_key_bytes),
+            )
+            .get_group_identifier();
         let mut results = match self
             .send_with_sender_key(
                 &mut sender,

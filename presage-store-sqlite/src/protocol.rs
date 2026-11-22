@@ -511,7 +511,7 @@ impl PreKeysStore for SqliteProtocolStore {
         let fresh = query_scalar!(
             "SELECT COUNT(*)
             FROM pre_keys
-            WHERE identity = ?1 AND stale_at = NULL",
+            WHERE identity = ?1 AND stale_at IS NULL",
             self.identity,
         )
         .fetch_one(&self.store.db)
@@ -523,7 +523,7 @@ impl PreKeysStore for SqliteProtocolStore {
         let victims = query_scalar!(
             "SELECT id
             FROM pre_keys
-            WHERE identity = ?1 AND stale_at != NULL AND stale_at < ?2
+            WHERE identity = ?1 AND stale_at IS NOT NULL AND stale_at < ?2
             ORDER BY stale_at ASC, id ASC",
             self.identity,
             threshold.naive_utc(),
@@ -817,7 +817,7 @@ impl KyberPreKeyStoreExt for SqliteProtocolStore {
         let fresh = query_scalar!(
             "SELECT COUNT(*)
             FROM kyber_pre_keys
-            WHERE identity = ?1 AND stale_at = NULL AND is_last_resort = FALSE",
+            WHERE identity = ?1 AND stale_at IS NULL AND is_last_resort = FALSE",
             self.identity,
         )
         .fetch_one(&self.store.db)
@@ -829,7 +829,7 @@ impl KyberPreKeyStoreExt for SqliteProtocolStore {
         let victims = query_scalar!(
             "SELECT id
             FROM kyber_pre_keys
-            WHERE identity = ?1 AND is_last_resort = FALSE AND stale_at != NULL AND stale_at < ?2
+            WHERE identity = ?1 AND is_last_resort = FALSE AND stale_at IS NOT NULL AND stale_at < ?2
             ORDER BY stale_at ASC, id ASC",
             self.identity,
             threshold.naive_utc(),
@@ -1072,7 +1072,7 @@ impl SqliteProtocolStore {
     /// number of kyber pre-keys we currently have in store
     pub async fn ec_one_time_pre_keys_count(&self) -> Result<usize, SignalProtocolError> {
         query_scalar!(
-            "SELECT COUNT(*) FROM pre_keys WHERE identity = ? AND stale_at = NULL",
+            "SELECT COUNT(*) FROM pre_keys WHERE identity = ? AND stale_at IS NULL",
             self.identity
         )
         .fetch_one(&self.store.db)
@@ -1100,7 +1100,7 @@ impl SqliteProtocolStore {
     ) -> Result<usize, SignalProtocolError> {
         if last_resort {
             query_scalar!(
-                "SELECT COUNT(*) FROM kyber_pre_keys WHERE identity = ? AND stale_at = NULL AND is_last_resort = TRUE",
+                "SELECT COUNT(*) FROM kyber_pre_keys WHERE identity = ? AND stale_at IS NULL AND is_last_resort = TRUE",
                 self.identity
             )
             .fetch_one(&self.store.db)
@@ -1183,7 +1183,7 @@ impl SqliteProtocolStore {
         let count = query!(
             "UPDATE pre_keys
             SET stale_at = ?1
-            WHERE identity = ?2 AND stale_at = NULL",
+            WHERE identity = ?2 AND stale_at IS NULL",
             stale_time.naive_utc(),
             self.identity,
         )
@@ -1226,7 +1226,7 @@ impl SqliteProtocolStore {
     ) -> Result<(), SignalProtocolError> {
         let count = query!(
             "UPDATE kyber_pre_keys SET stale_at = ?2
-            WHERE identity = ?1 AND is_last_resort = FALSE AND stale_at = NULL",
+            WHERE identity = ?1 AND is_last_resort = FALSE AND stale_at IS NULL",
             self.identity,
             &stale_time.timestamp_millis(),
         )
@@ -1777,6 +1777,45 @@ mod test {
             Some(verified),
             "saving what they have changes nothing"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_one_time_pre_keys() -> Result<(), Box<dyn std::error::Error>> {
+        use presage::libsignal_service::pre_keys::generate_one_time_pre_keys;
+        let mut store = SqliteProtocolStore {
+            store: SqliteStore::open(":memory:", OnNewIdentity::Trust).await?,
+            identity: IdentityType::Aci,
+        };
+        let identity = IdentityKeyPair::generate(&mut rand::rng());
+        for _ in 0..2 {
+            let (ec, kyber) =
+                generate_one_time_pre_keys(&mut store, &mut rand::rng(), &identity, 3, 2).await?;
+            store.store_one_time_pre_key_bundle(&ec, &kyber).await?;
+        }
+        assert_eq!(store.ec_one_time_pre_keys_count().await?, 3);
+        let stale: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kyber_pre_keys WHERE stale_at IS NOT NULL")
+                .fetch_one(&store.store.db)
+                .await?;
+        assert_eq!(stale, 2);
+
+        let future = Utc::now() + chrono::Duration::days(1);
+        store
+            .delete_all_stale_one_time_ec_pre_keys(future, 0)
+            .await?;
+        store
+            .delete_all_stale_one_time_kyber_pre_keys(future, 0)
+            .await?;
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pre_keys")
+            .fetch_one(&store.store.db)
+            .await?;
+        assert_eq!(left, 3);
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kyber_pre_keys WHERE is_last_resort = FALSE")
+                .fetch_one(&store.store.db)
+                .await?;
+        assert_eq!(left, 2);
         Ok(())
     }
 
